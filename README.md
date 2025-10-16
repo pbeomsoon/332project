@@ -48,4 +48,9 @@
 
 
 ## Weekly Document
+#### Format
+1. Progress in the week
+2. Goal of the next week
+3. Goal of the next week for each individual member
+  
 To be updated
