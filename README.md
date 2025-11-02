@@ -55,7 +55,7 @@
   
 #### Progress
 * Week 1: [Here](./meet_log/week1/week1_document.md)
-* Week 2: To be updated
+* Week 2: [Here](./meet_log/week2/week2_document.md)
 * Week 3: To be updated
 * Week 4: To be updated
 * Week 5: To be updated
