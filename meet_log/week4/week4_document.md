@@ -53,8 +53,14 @@
   - `5-file-management.md`: 파일 시스템 레이아웃
   - `6-parallelization.md`: 멀티스레딩 전략
 
+- `plan/` 폴더: 구현 계획 및 로드맵 문서화
+  - `implementation_guide.md`: 완전한 구현 로드맵
+  - `requirements_verification.md`: 요구사항 검증
+  - 초기 계획 버전들 (ver1, ver2, ver3)
+  - TDD 가이드 문서들
+
 **문서 공개**:
-- 설계 단계에서 작성한 핵심 문서를 공개
+- 설계 단계에서 작성한 모든 문서를 공개
 - 구현 전략 및 기술 결정 사항 투명하게 공개
 - 체계적인 설계 프로세스 입증
 
