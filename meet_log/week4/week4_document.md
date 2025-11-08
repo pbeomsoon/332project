@@ -33,8 +33,30 @@
 
 #### 3. 점진적 개발 전략 수립
 **GitHub 공개 전략**:
-- 주차별로 완성된 컴포넌트 점진적으로 개발발
-- 각 week마다 코드 repository에 추가
+- 주차별로 완성된 컴포넌트만 점진적으로 공개
+- 각 week마다 검증된 코드만 repository에 추가
+- 마감 시점에 전체 통합 코드 공개 예정
+
+**이점**:
+- 코드 품질 관리 용이
+- 체계적인 버전 관리
+- 단계별 진행 상황 명확한 추적
+
+#### 4. 설계 문서 구체화 및 공개
+**Week 1-2 설계 문서 구체화**:
+- `docs/` 폴더: 핵심 설계 문서 작성 완료
+  - `0-implementation-decisions.md`: 핵심 아키텍처 결정사항
+  - `1-phase-coordination.md`: Master-Worker 단계 동기화
+  - `2-worker-state-machine.md`: Worker 생명주기 상태
+  - `3-grpc-sequences.md`: 완전한 gRPC 프로토콜
+  - `4-error-recovery.md`: Fault tolerance 전략
+  - `5-file-management.md`: 파일 시스템 레이아웃
+  - `6-parallelization.md`: 멀티스레딩 전략
+
+**문서 공개**:
+- 설계 단계에서 작성한 핵심 문서를 공개
+- 구현 전략 및 기술 결정 사항 투명하게 공개
+- 체계적인 설계 프로세스 입증
 
 ### 테스트 현황
 ```
