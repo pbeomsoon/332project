@@ -13,7 +13,7 @@
 
 ### 프로젝트 구조
 ```
-week3_partial/
+week4_work/
 ├── build.sbt              # SBT 빌드 설정
 ├── project/
 │   ├── build.properties
