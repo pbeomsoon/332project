@@ -1,0 +1,166 @@
+# ============================================================
+# CSED332 Project .gitignore
+# Purpose: Prevent binary/intermediate files from being committed
+# ============================================================
+#
+# ⚠️ TA WARNING (Effective from Assignment 3):
+# 1. Do NOT include binary or intermediate files (.class, .jar)
+# 2. Run "sbt clean" before making a commit
+# 3. Review staged changes carefully (git diff --staged)
+# 4. Do NOT use "git add -A" or "git add ."
+# 5. Errors from unwanted files will affect your grade!
+#
+# Reference: TA Notice from Seonggon Namgung
+# ============================================================
+
+# ============================================================
+# 1. SBT (Scala Build Tool) - Compilation Artifacts
+# ============================================================
+# TA Warning: Do not include .class or .jar files!
+target/
+project/target/
+project/project/
+*.class
+*.jar
+*.war
+*.ear
+
+# SBT specific
+dist/*
+lib_managed/
+src_managed/
+project/boot/
+project/plugins/project/
+.history
+.cache
+.lib/
+
+# ============================================================
+# 2. IDE Files (IntelliJ IDEA, Eclipse, VS Code)
+# ============================================================
+# These are IDE-specific configurations
+# Should not be in version control
+
+## IntelliJ IDEA
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
+
+## Eclipse
+.classpath
+.project
+.settings/
+bin/
+
+## VS Code
+.vscode/
+*.code-workspace
+
+## Metals (Scala Language Server)
+.metals/
+.bloop/
+metals.sbt
+
+# ============================================================
+# 3. Scala & Java Compilation Outputs
+# ============================================================
+*.log
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ============================================================
+# 4. Test Reports & Coverage
+# ============================================================
+test-output/
+target/test-reports/
+target/scala-*/scoverage-data/
+target/scala-*/scoverage-report/
+target/streams/
+
+# ============================================================
+# 5. Temporary Files (DO NOT COMMIT!)
+# ============================================================
+# Runtime temporary files
+*.tmp
+*.temp
+.tmp/
+.temp/
+
+# OS-specific
+Thumbs.db
+Desktop.ini
+
+# ============================================================
+# 6. Project-Specific (Distributed Sort System)
+# ============================================================
+# These are runtime/test artifacts
+
+## Test data directories
+test-input/
+test-output/
+test-temp/
+
+## Runtime directories (created during execution)
+/data1/
+/data2/
+/home/*/data/
+*.dat
+*.sorted
+
+## Log files
+logs/
+*.log
+*.log.*
+
+## Generated partition files (these are outputs, not source)
+partition.*
+chunk_*.sorted
+
+## Sampling files
+samples/
+*.sample
+
+# ============================================================
+# 7. gensort/valsort Tools (if downloaded locally)
+# ============================================================
+gensort
+valsort
+gensort-linux/
+*.tar.gz
+
+# ============================================================
+# IMPORTANT: What TO COMMIT
+# ============================================================
+# ✅ Source code: src/main/scala/**/*.scala
+# ✅ Test code: src/test/scala/**/*.scala
+# ✅ Proto files: src/main/protobuf/**/*.proto
+# ✅ Build config: build.sbt, project/build.properties, project/plugins.sbt
+# ✅ Documentation: docs/**/*.md, plan/**/*.md, README.md
+# ✅ This file: .gitignore
+
+# ============================================================
+# IMPORTANT: What NOT TO COMMIT
+# ============================================================
+# ❌ Binary files: *.class, *.jar
+# ❌ IDE files: .idea/, *.iml
+# ❌ Build outputs: target/
+# ❌ Test artifacts: test-output/, *.dat
+# ❌ Logs: *.log
+# ❌ Temporary files: *.tmp, .cache
+
+# ============================================================
+# Verification Command
+# ============================================================
+# Before committing, always run:
+#   1. sbt clean
+#   2. git status (check for unwanted files)
+#   3. git add <specific-files>  (NOT "git add -A"!)
+#   4. git commit -m "message"
+#
+# To check what will be committed:
+#   git diff --staged
+# ============================================================
