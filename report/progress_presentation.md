@@ -9,14 +9,13 @@
 ## 목차
 
 1. [프로젝트 개요](#1-프로젝트-개요)
-2. [TDD 기반 개발 방법론](#2-tdd-기반-개발-방법론)
-3. [시스템 아키텍처](#3-시스템-아키텍처)
-4. [핵심 설계 결정 사항](#4-핵심-설계-결정-사항)
+2. [Challenges (도전 과제)](#2-challenges-도전-과제)
+3. [해결 방안](#3-해결-방안)
+4. [개발 방법론: TDD](#4-개발-방법론-tdd)
 5. [현재 진행 상황 (Week 4-5)](#5-현재-진행-상황-week-4-5)
-6. [구현 상세 (Week 4-5)](#6-구현-상세-week-4-5)
-7. [향후 계획 (Week 6-8)](#7-향후-계획-week-6-8)
-8. [Q&A 준비](#8-qa-준비)
-9. [참고 문헌](#9-참고-문헌)
+6. [향후 계획 (Week 6-8)](#6-향후-계획-week-6-8)
+7. [Q&A 준비](#7-qa-준비)
+8. [참고 문헌](#8-참고-문헌)
 
 ---
 
@@ -24,17 +23,17 @@
 
 ### 1.1 목표
 
-여러 머신에 분산 저장된 대용량 key/value 레코드를 정렬하는 **장애 허용성 분산 시스템** 구현
+여러 머신에 분산 저장된 대용량 key/value 레코드를 **정렬**하는 **장애 허용성** 분산 시스템 구현
 
 ### 1.2 핵심 요구사항
 
-| 항목 | 요구사항 | 구현 전략 |
-|------|---------|----------|
-| **입력** | 여러 Worker 노드에 분산된 미정렬 데이터 | ASCII/Binary 자동 감지 |
-| **출력** | 전역적으로 정렬된 데이터 | Range-based Partitioning |
-| **장애 허용** | Worker crash 후 재시작 시 정상 동작 | Worker Re-registration |
-| **확장성** | 멀티코어 병렬 처리 | ThreadPool 기반 |
-| **검증** | gensort/valsort 도구 활용 | TDD 기반 개발 |
+| 항목 | 요구사항 |
+|------|---------|
+| **입력** | 여러 Worker 노드에 분산된 미정렬 데이터 |
+| **출력** | 전역적으로 정렬된 데이터 (partition.0, partition.1, ...) |
+| **레코드** | 100-byte (10-byte key + 90-byte value) |
+| **정렬** | Key만 사용 (unsigned byte 비교) |
+| **검증** | gensort/valsort 도구 활용 |
 
 ### 1.3 기술 스택
 
@@ -42,15 +41,659 @@
 언어:        Scala 2.13
 빌드 도구:   SBT 1.9.7
 RPC:         gRPC + Protocol Buffers
-테스트:      ScalaTest
+테스트:      ScalaTest (TDD)
 버전 관리:   Git
+```
+
+### 1.4 레코드 구조
+
+```
+┌──────────────┬────────────────────────────────────────┐
+│ Key (10B)    │ Value (90B)                            │
+└──────────────┴────────────────────────────────────────┘
+  0            10                                      100
+
+특징:
+- 고정 길이: 100 바이트
+- Key만 정렬 기준 (unsigned 비교)
+- Value는 Key와 함께 이동
 ```
 
 ---
 
-## 2. TDD 기반 개발 방법론
+## 2. Challenges (도전 과제)
 
-### 2.1 TDD란?
+### Challenge 1: 입력이 메모리보다 큼
+
+**문제**:
+- 입력 데이터가 메모리에 들어가지 않음
+- 예: 입력 50GB, 메모리 8GB
+
+**해결책**: **Disk-based Merge Sort** (External Sort)
+
+```
+50GB 입력
+  ↓
+Read → 100MB chunks → Sort/Write (병렬)
+  ↓
+Merge (merging 500 files) using K-way merge
+  ↓
+50GB 정렬된 출력
+```
+
+### Challenge 2: 입력이 디스크보다 큼 (분산 환경)
+
+**문제**:
+- 입력 데이터가 단일 디스크에 들어가지 않음
+- 예: 입력 10TB, 디스크 1TB
+- 입력/출력이 **여러 머신**에 분산 저장
+
+**해결책**: **Distributed Sorting** (Master-Worker)
+
+```
+┌─────────────┐       ┌─────────────┐       ┌─────────────┐
+│  Worker 0   │       │  Worker 1   │       │  Worker 2   │
+│  Input: 50GB│       │  Input: 50GB│       │  Input: 50GB│
+└─────────────┘       └─────────────┘       └─────────────┘
+       ↓                     ↓                     ↓
+    Sort/Partition     Sort/Partition     Sort/Partition
+       ↓                     ↓                     ↓
+       └──────────── Shuffle (Network) ────────────┘
+                            ↓
+                     Merge on each worker
+                            ↓
+           ┌────────────────┼────────────────┐
+           ↓                ↓                ↓
+       50GB #1          50GB #2          50GB #3
+    (partition.0-2)  (partition.3-5)  (partition.6-8)
+```
+
+### Challenge 3: Workers may crash
+
+**문제**:
+- Worker가 실행 중 crash (killed by OS)
+- 모든 중간 데이터 손실
+- 같은 노드에서 새 Worker 시작 (같은 파라미터)
+
+**요구사항**: **Fault-tolerant**
+- 새 Worker가 기존 Worker와 동일한 출력 생성
+- 전체 시스템이 정확한 결과 생성
+
+**해결책**: **Checkpoint-based Recovery**
+
+```
+Worker crash during Shuffle:
+  Last checkpoint: PHASE_SORTING (100% 완료)
+
+Worker restart:
+  1. Load checkpoint
+  2. Restore state (partitionBoundaries, shuffleMap, ...)
+  3. Resume from PHASE_SORTING
+     ⭐ Sampling/Sort 스킵 (빠른 복구)
+  4. Continue: Shuffle → Merge → Complete
+```
+
+### Additional Requirements
+
+#### Requirement 1: ASCII/Binary 자동 감지
+- ASCII와 Binary 입력을 **옵션 없이** 처리
+- 파일 형식을 자동으로 감지
+
+#### Requirement 2: 입력 디렉토리 보호
+- 입력 디렉토리는 **읽기 전용**
+- 입력 파일 삭제 금지
+- 입력 디렉토리에 새 파일 생성 금지
+
+#### Requirement 3: 출력 디렉토리 정리
+- 출력 디렉토리는 **최종 파일만** 포함
+- 임시 파일/디렉토리 생성 가능, 단 **작업 완료 후 삭제**
+
+#### Requirement 4: 포트 하드코딩 금지
+- 특정 포트를 하드코딩하지 말 것
+- 다양한 입출력 디렉토리로 여러 Worker 실행 가능
+
+---
+
+## 3. 해결 방안
+
+### 3.1 전체 시스템 아키텍처
+
+```
+┌─────────────────────────────────────────────────────┐
+│                  Master Node                        │
+│  - Worker 등록 관리                                  │
+│  - 샘플 수집 및 파티션 경계 계산                       │
+│  - shuffleMap 생성 및 브로드캐스트                    │
+│  - Phase 동기화 조율                                 │
+│  - 최종 Worker 순서 출력                             │
+└───────────────┬─────────────────────────────────────┘
+                │ gRPC
+        ┌───────┴───────┬──────────┬──────────┐
+        │               │          │          │
+   ┌────▼─────┐   ┌────▼────┐ ┌──▼──────┐ ┌──▼──────┐
+   │ Worker 0 │   │Worker 1 │ │Worker 2 │ │Worker 3 │
+   │          │   │         │ │         │ │         │
+   │Input:    │   │Input:   │ │Input:   │ │Input:   │
+   │50GB      │   │50GB     │ │50GB     │ │50GB     │
+   │          │   │         │ │         │ │         │
+   │Output:   │   │Output:  │ │Output:  │ │Output:  │
+   │P0,P1,P2  │   │P3,P4,P5 │ │P6,P7,P8 │ │P9,P10,P11│
+   └──────────┘   └─────────┘ └─────────┘ └─────────┘
+        │               │          │          │
+        └───────────────┴──────────┴──────────┘
+       Worker-to-Worker Shuffle (gRPC Streaming)
+```
+
+### 3.2 5-Phase 실행 흐름
+
+```
+Phase 0: Initialization
+  ├─ Master 시작, Worker들 등록 대기
+  ├─ 각 Worker 시작, Master에 연결
+  ├─ Master가 Worker에 index 할당
+  └─ 디스크 공간 검증
+
+Phase 1: Sampling
+  ├─ 각 Worker가 입력 데이터에서 샘플 추출
+  ├─ 동적 샘플링 비율 계산 (0.01% ~ 1%)
+  ├─ Master에게 샘플 전송
+  ├─ Master가 전체 샘플 정렬
+  ├─ 파티션 경계 계산 (N개 or M개)
+  └─ shuffleMap 생성 및 브로드캐스트
+
+Phase 2: Sort & Partition
+  ├─ 각 Worker가 입력 파일 읽기 (ASCII/Binary 자동 처리)
+  ├─ External Sort: Chunk 단위 정렬 (병렬)
+  │   └─ 메모리 제한 준수 (512MB chunks)
+  ├─ 파티션 경계에 따라 분할 (N개 또는 M개)
+  └─ 파티션별 임시 파일 생성
+
+Phase 3: Shuffle
+  ├─ shuffleMap에 따라 파티션 전송
+  ├─ Worker 간 네트워크 통신 (gRPC streaming)
+  ├─ 재시도 로직 (지수 백오프)
+  └─ 수신 확인 및 임시 저장
+
+Phase 4: Merge
+  ├─ 각 Worker가 받은 파티션들을 개별적으로 K-way merge
+  ├─ Priority Queue (min-heap) 사용
+  ├─ 최종 partition.n 파일 생성
+  └─ Atomic write 보장 (temp + rename)
+
+Phase 5: Completion
+  ├─ 각 Worker가 Master에게 완료 보고
+  ├─ Master가 전체 작업 완료 확인
+  ├─ Master가 정렬된 Worker 주소 출력 (stdout)
+  └─ 임시 파일 정리
+```
+
+### 3.3 Challenge 1 해결: External Sort (메모리 제한)
+
+**문제**: 입력이 메모리보다 큼 (50GB vs 8GB)
+
+**해결책**: 2-Pass External Sort
+
+#### Phase 1: Chunk Sort (병렬)
+
+```scala
+class ExternalSorter(
+  memoryLimit: Long = 512 * 1024 * 1024  // 512MB 제한
+) {
+  private val recordsPerChunk = (memoryLimit / 100).toInt
+
+  def createSortedChunksParallel(records: Seq[Record]): Seq[File] = {
+    val chunks = records.grouped(recordsPerChunk).toSeq  // ⭐ Chunk로 분할
+
+    // 병렬 정렬 (멀티코어 활용)
+    val futures = chunks.zipWithIndex.map { case (chunk, index) =>
+      Future {
+        val sorted = chunk.sorted              // ⭐ 메모리 내 정렬
+        writeChunkToFile(sorted, chunkFile)    // ⭐ 디스크에 저장
+        chunkFile
+      }
+    }
+
+    Await.result(Future.sequence(futures), Duration.Inf)
+  }
+}
+```
+
+#### Phase 2: K-way Merge (Priority Queue)
+
+```scala
+class KWayMerger(sortedChunks: Seq[File]) {
+
+  def mergeWithCallback(callback: Record => Unit): Unit = {
+    val readers = sortedChunks.map(RecordReader.create)
+    val heap = mutable.PriorityQueue[HeapEntry]()  // ⭐ Min-heap
+
+    // 각 chunk에서 첫 레코드 읽기
+    readers.zipWithIndex.foreach { case (reader, index) =>
+      reader.readRecord() match {
+        case Some(record) => heap.enqueue(HeapEntry(record, index))
+        case None => // Empty chunk
+      }
+    }
+
+    // 정렬된 순서로 스트리밍 처리 (메모리 효율적)
+    while (heap.nonEmpty) {
+      val entry = heap.dequeue()
+      callback(entry.record)  // ⭐ 하나씩 처리 (메모리 절약)
+
+      // 같은 소스에서 다음 레코드 읽기
+      readers(entry.sourceIndex).readRecord() match {
+        case Some(nextRecord) =>
+          heap.enqueue(HeapEntry(nextRecord, entry.sourceIndex))
+        case None => // Source exhausted
+      }
+    }
+  }
+}
+```
+
+**장점**:
+- ✅ 임의 크기 입력 처리 가능 (1KB ~ 10TB+)
+- ✅ 병렬 정렬 (멀티코어 활용)
+- ✅ 스트리밍 병합 (메모리 효율)
+
+### 3.4 Challenge 2 해결: Distributed System (분산)
+
+**문제**: 입력이 디스크보다 큼, 여러 머신에 분산
+
+**해결책**: Master-Worker 아키텍처 + N→M Partition Strategy
+
+#### N→M Partition Strategy
+
+**개념**: 파티션 수 > Worker 수 (일반적으로 M = 3N)
+
+**예시: 4 Workers, 12 Partitions**
+
+```
+Phase 2: Sort & Partition
+  Worker 0, 1, 2, 3 각각 → P0~P11 (12개) 생성
+
+Phase 3: Shuffle
+  P0, P1, P2   → Worker 0
+  P3, P4, P5   → Worker 1
+  P6, P7, P8   → Worker 2
+  P9, P10, P11 → Worker 3
+
+Phase 4: Merge
+  Worker 0:
+    - 4개 P0 조각 K-way merge → partition.0
+    - 4개 P1 조각 K-way merge → partition.1
+    - 4개 P2 조각 K-way merge → partition.2
+
+최종 출력:
+  /worker0/output/partition.0  ← 가장 작은 key
+  /worker0/output/partition.1
+  /worker0/output/partition.2
+  /worker1/output/partition.3
+  ...
+  /worker3/output/partition.11 ← 가장 큰 key
+
+읽기 순서: partition.0 → 1 → 2 → ... → 11 = 전역 정렬됨
+```
+
+**shuffleMap 생성**:
+```scala
+def createShuffleMap(numWorkers: Int, numPartitions: Int): Map[Int, Int] = {
+  val partitionsPerWorker = numPartitions / numWorkers
+
+  (0 until numPartitions).map { partitionID =>
+    val workerID = partitionID / partitionsPerWorker
+    val finalWorkerID = if (workerID >= numWorkers) numWorkers - 1 else workerID
+    partitionID -> finalWorkerID
+  }.toMap
+}
+
+// 예시: createShuffleMap(4, 12)
+//   → {0→0, 1→0, 2→0, 3→1, 4→1, 5→1, 6→2, 7→2, 8→2, 9→3, 10→3, 11→3}
+```
+
+**장점**:
+- ✅ 로드 밸런싱 개선 (파티션 수 증가)
+- ✅ 멀티코어 활용 증가 (병렬 merge)
+- ✅ 파티션 크기 불균형 완화
+
+### 3.5 Challenge 3 해결: Checkpoint-based Recovery
+
+**문제**: Worker가 실행 중 crash → 모든 중간 데이터 손실
+
+**해결책**: Phase별 Checkpoint + Graceful Shutdown
+
+#### Checkpoint 저장
+
+```scala
+case class WorkerState(
+  processedRecords: Long,                  // 처리한 레코드 수
+  partitionBoundaries: List[Array[Byte]], // 파티션 경계
+  shuffleMap: Map[Int, Int],               // 파티션 → Worker 매핑
+  completedPartitions: Set[Int],           // 완료한 파티션들
+  currentFiles: List[String],              // 현재 파일들
+  phaseMetadata: Map[String, String]       // Phase 메타데이터
+)
+
+class CheckpointManager(workerId: String) {
+  def saveCheckpoint(
+    phase: WorkerPhase,
+    state: WorkerState,
+    progress: Double
+  ): Future[String] = Future {
+    val checkpointId = s"checkpoint_${System.currentTimeMillis()}_${phase}"
+    val checkpoint = Checkpoint(checkpointId, workerId, phase.toString,
+                                 Instant.now(), progress, state)
+
+    // JSON으로 저장: /tmp/distsort/checkpoints/{workerId}/{checkpointId}.json
+    val file = checkpointPath.resolve(s"$checkpointId.json").toFile
+    val writer = new PrintWriter(file)
+    writer.write(gson.toJson(checkpoint))
+    writer.close()
+
+    checkpointId
+  }
+}
+```
+
+**저장 시점**:
+```scala
+performSampling()
+  → savePhaseCheckpoint(PHASE_SAMPLING, 1.0)       // ✅
+
+getPartitionConfiguration()
+  → savePhaseCheckpoint(PHASE_WAITING_FOR_PARTITIONS, 1.0)  // ✅
+
+performLocalSort()
+  → savePhaseCheckpoint(PHASE_SORTING, 1.0)        // ✅
+
+performShuffle()
+  → savePhaseCheckpoint(PHASE_SHUFFLING, 1.0)      // ✅
+
+performMerge()
+  → savePhaseCheckpoint(PHASE_MERGING, 1.0)        // ✅
+  → checkpointManager.deleteAllCheckpoints()       // 성공 시 삭제
+```
+
+#### 복구 로직
+
+```scala
+class Worker(...) {
+  def run(): Unit = {
+    // 1. Checkpoint에서 복구 시도
+    val recoveredFromCheckpoint = recoverFromCheckpoint()
+
+    if (!recoveredFromCheckpoint || currentPhase.get() == PHASE_INITIALIZING) {
+      performSampling()
+    }
+
+    // 복구된 Phase에 따라 적절한 단계부터 재개
+    if (currentPhase.get() == PHASE_SAMPLING || ...) {
+      getPartitionConfiguration()
+      savePhaseCheckpoint(PHASE_WAITING_FOR_PARTITIONS, 1.0)
+    }
+
+    if (currentPhase.get() == PHASE_SORTING || ...) {
+      performLocalSort()
+      savePhaseCheckpoint(PHASE_SORTING, 1.0)
+
+      performShuffle()
+      savePhaseCheckpoint(PHASE_SHUFFLING, 1.0)
+    }
+
+    performMerge()
+    savePhaseCheckpoint(PHASE_MERGING, 1.0)
+
+    checkpointManager.deleteAllCheckpoints()
+  }
+
+  private def recoverFromCheckpoint(): Boolean = {
+    checkpointManager.loadLatestCheckpoint() match {
+      case Some(checkpoint) =>
+        // 상태 복원
+        partitionBoundaries = checkpoint.state.partitionBoundaries.toArray
+        shuffleMap = checkpoint.state.shuffleMap
+        completedPartitions = checkpoint.state.completedPartitions
+
+        // Phase 복원
+        currentPhase.set(WorkerPhase.fromName(checkpoint.phase))
+        true  // 복구 성공
+
+      case None =>
+        false  // 처음부터 시작
+    }
+  }
+}
+```
+
+**복구 시나리오**:
+```
+Worker crash during Shuffle:
+  Last checkpoint: PHASE_SORTING (100% 완료)
+
+Worker restart:
+  1. recoverFromCheckpoint() 성공
+  2. currentPhase = PHASE_SORTING (복원)
+  3. performShuffle() 재시작
+     ⭐ Sampling/Sort는 스킵 (시간 대폭 절약)
+  4. Merge → 완료
+
+Result:
+  ✅ 마지막 완료 Phase부터 재개
+  ✅ 빠른 복구 (전체 재시작 대비)
+  ✅ 정확성 보장
+```
+
+#### Graceful Shutdown
+
+```scala
+class Worker(...) extends ShutdownAware {
+  private val shutdownManager = GracefulShutdownManager(
+    ShutdownConfig(
+      gracePeriod = 30.seconds,       // ⭐ 30초 대기
+      saveCheckpoint = true,           // ⭐ Checkpoint 저장
+      waitForCurrentPhase = true       // ⭐ 현재 Phase 완료 대기
+    )
+  )
+
+  override def gracefulShutdown(): Future[Unit] = {
+    // 1. 현재 Phase 완료 대기 (최대 30초)
+    // 2. Checkpoint 저장
+    val currentState = getCurrentState()
+    checkpointManager.saveCheckpoint(currentPhase.get(), currentState, 0.5)
+
+    // 3. 리소스 정리
+    cleanupResources()
+  }
+}
+```
+
+**장점**:
+- ✅ 빠른 복구 (마지막 완료 Phase부터 재개)
+- ✅ 정확성 보장 (Phase별 완료 checkpoint)
+- ✅ Graceful Shutdown (안전한 종료)
+- ✅ 간단한 구현 (JSON 직렬화 + 최근 3개 유지)
+
+### 3.6 Additional Requirements 해결
+
+#### Requirement 1: ASCII/Binary 자동 감지
+
+```scala
+object InputFormatDetector {
+  private val SAMPLE_SIZE = 1000      // 첫 1000 바이트 분석
+  private val ASCII_THRESHOLD = 0.9   // 90% 이상 ASCII
+
+  def detectFormat(file: File): DataFormat = {
+    val buffer = new Array[Byte](SAMPLE_SIZE)
+    val inputStream = new FileInputStream(file)
+    val bytesRead = inputStream.read(buffer)
+
+    // ASCII printable 문자 비율 계산
+    val asciiCount = buffer.take(bytesRead).count { b =>
+      (b >= 32 && b <= 126) || b == '\n' || b == '\r'
+    }
+
+    val asciiRatio = asciiCount.toDouble / bytesRead
+
+    if (asciiRatio > ASCII_THRESHOLD) DataFormat.Ascii
+    else DataFormat.Binary
+  }
+}
+
+// RecordReader Factory Pattern
+object RecordReader {
+  def create(file: File): RecordReader = {
+    val format = InputFormatDetector.detectFormat(file)  // ⭐ 자동 감지
+    format match {
+      case DataFormat.Binary => new BinaryRecordReader()
+      case DataFormat.Ascii  => new AsciiRecordReader()
+    }
+  }
+}
+```
+
+**혼합 입력 처리**:
+- 각 파일마다 독립적으로 형식 감지
+- ASCII와 Binary 파일 혼재 가능
+
+#### Requirement 2 & 3: 입력 보호 + 출력 정리
+
+```scala
+class FileLayout(
+  inputDirs: List[File],    // 읽기 전용
+  outputDir: File,          // 최종 partition.* 파일만
+  tempBaseDir: File         // 임시 파일 (자동 삭제)
+) {
+  /**
+   * 입력 디렉토리 검증 (읽기 전용)
+   */
+  def validateInputDirectories(): Unit = {
+    inputDirs.foreach { dir =>
+      require(dir.exists() && dir.canRead, s"Cannot read: $dir")
+      // ⭐ 수정 금지 (읽기만)
+    }
+  }
+
+  /**
+   * 임시 디렉토리 구조 생성
+   */
+  def createTemporaryStructure(): Unit = {
+    val workDir = new File(tempBaseDir, s"sort_work_$workerId")
+    val subdirs = List("samples", "sorted_chunks", "partitions", "received")
+
+    subdirs.foreach { subdir =>
+      val dir = new File(workDir, subdir)
+      dir.mkdirs()  // ⭐ /tmp/distsort/ 하위에 생성
+    }
+  }
+
+  /**
+   * 임시 파일 정리
+   */
+  def cleanupTemporaryFiles(): Unit = {
+    val workDir = new File(tempBaseDir, s"sort_work_$workerId")
+    if (workDir.exists()) {
+      deleteRecursively(workDir)  // ⭐ 임시 파일 모두 삭제
+    }
+  }
+}
+```
+
+**디렉토리 구조**:
+```
+Input:    /data1/input/         (읽기 전용, 수정 금지)
+Output:   /home/gla/data/       (최종 partition.* 파일만)
+Temp:     /tmp/sort_work_W0/    (임시 파일, 자동 삭제)
+          ├── samples/
+          ├── sorted_chunks/
+          ├── partitions/
+          └── received/
+```
+
+#### Requirement 4: 포트 하드코딩 금지
+
+```scala
+class Worker(
+  workerId: String,
+  masterHost: String,
+  masterPort: Int,
+  workerPort: Int = 0  // ⭐ 0 = 자동 할당
+) {
+  def start(): Unit = {
+    server = ServerBuilder
+      .forPort(workerPort)  // ⭐ 0이면 자동 할당
+      .addService(...)
+      .build()
+
+    server.start()
+    actualPort = server.getPort  // ⭐ 실제 할당된 포트
+
+    logger.info(s"Worker $workerId started on port $actualPort")
+  }
+}
+```
+
+**장점**:
+- ✅ 여러 Worker를 같은 머신에서 실행 가능
+- ✅ 포트 충돌 방지
+
+### 3.7 gRPC 기반 통신
+
+```protobuf
+service MasterService {
+  rpc RegisterWorker(WorkerInfo) returns (RegistrationResponse);
+  rpc SendSample(SampleData) returns (Ack);
+  rpc NotifyPhaseComplete(PhaseCompleteRequest) returns (Ack);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+}
+
+service WorkerService {
+  rpc SetPartitionBoundaries(PartitionConfig) returns (Ack);
+  rpc ShuffleData(stream ShuffleDataChunk) returns (ShuffleAck);
+  rpc StartShuffle(ShuffleSignal) returns (Ack);
+  rpc StartMerge(MergeSignal) returns (Ack);
+  rpc GetStatus(StatusRequest) returns (WorkerStatus);
+}
+
+message PartitionConfig {
+  repeated bytes boundaries = 1;       // N-1 or M-1 개의 경계
+  int32 num_partitions = 2;            // N or M
+  map<int32, int32> shuffle_map = 3;   // partitionID → workerID
+  repeated WorkerInfo all_workers = 4;
+}
+```
+
+**Shuffle 재시도 로직**:
+```scala
+def sendPartitionWithRetry(
+    partitionFile: File,
+    partitionId: Int,
+    targetWorker: WorkerInfo,
+    maxRetries: Int = 3
+): Unit = {
+  var attempt = 0
+  var success = false
+
+  while (attempt < maxRetries && !success) {
+    try {
+      sendPartition(partitionFile, partitionId, targetWorker)
+      success = true
+    } catch {
+      case e: StatusRuntimeException if isRetryable(e) =>
+        attempt += 1
+        val backoffMs = math.pow(2, attempt).toLong * 1000  // 지수 백오프
+        Thread.sleep(backoffMs)
+      case e: Exception =>
+        throw e
+    }
+  }
+}
+```
+
+---
+
+## 4. 개발 방법론: TDD
+
+### 4.1 TDD란?
 
 **Test-Driven Development**: 구현 전에 테스트를 먼저 작성하는 개발 방식
 
@@ -67,7 +710,7 @@ RPC:         gRPC + Protocol Buffers
                 (깔끔하게 만들기)
 ```
 
-### 2.2 분산 시스템에서 TDD의 중요성
+### 4.2 분산 시스템에서 TDD의 중요성
 
 | 문제 | TDD를 통한 해결 |
 |------|----------------|
@@ -77,7 +720,7 @@ RPC:         gRPC + Protocol Buffers
 | Fault tolerance | 메커니즘 검증 |
 | 리팩토링 | 안전성 보장 |
 
-### 2.3 TDD 실전 예시 - Record 클래스
+### 4.3 TDD 실전 예시 - Record 클래스
 
 #### Step 1: 🔴 RED - 실패하는 테스트 작성
 
@@ -94,13 +737,13 @@ class RecordSpec extends AnyFlatSpec with Matchers {
   }
 
   it should "compare records by key only (unsigned)" in {
-    // 0xFF (255) > 0x01 (1) in unsigned comparison
+    // ⭐ 중요: 0xFF (255) > 0x01 (1) in unsigned comparison
     val rec1 = Record(Array[Byte](0xFF.toByte) ++ Array.fill[Byte](9)(0),
                       Array.fill[Byte](90)(0))
     val rec2 = Record(Array[Byte](0x01) ++ Array.fill[Byte](9)(0),
                       Array.fill[Byte](90)(0))
 
-    rec1.compare(rec2) should be > 0
+    rec1.compare(rec2) should be > 0  // ⭐ Unsigned 비교
   }
 }
 ```
@@ -160,9 +803,7 @@ case class Record(key: Array[Byte], value: Array[Byte]) extends Ordered[Record] 
 
 **실행 결과**: ✅ 테스트 여전히 통과 + 가독성 향상
 
-### 2.4 우리 프로젝트의 TDD 적용
-
-#### Testing Pyramid
+### 4.4 Testing Pyramid
 
 ```
             ┌─────────────┐
@@ -183,459 +824,13 @@ case class Record(key: Array[Byte], value: Array[Byte]) extends Ordered[Record] 
 
 | 컴포넌트 | 테스트 개수 | 상태 |
 |---------|-----------|------|
-| Record | 5 tests | ✅ 완료 |
-| RecordReader (Binary) | 📋 설계 | 예정 |
-| RecordReader (ASCII) | 📋 설계 | 예정 |
-| InputFormatDetector | 📋 설계 | 예정 |
-| FileLayout | 📋 설계 | 예정 |
-
----
-
-## 3. 시스템 아키텍처
-
-### 3.1 전체 구조
-
-```
-┌─────────────────────────────────────────────────────┐
-│                  Master Node                        │
-│  - Worker 등록 관리                                  │
-│  - 샘플 수집 및 파티션 경계 계산                       │
-│  - shuffleMap 생성 및 브로드캐스트                    │
-│  - Phase 동기화 조율                                 │
-│  - 최종 Worker 순서 출력                             │
-└───────────────┬─────────────────────────────────────┘
-                │
-        ┌───────┴───────┬──────────┬──────────┐
-        │               │          │          │
-   ┌────▼─────┐   ┌────▼────┐ ┌──▼──────┐
-   │ Worker 0 │   │Worker 1 │ │Worker 2 │
-   │          │   │         │ │         │
-   │Input:    │   │Input:   │ │Input:   │
-   │50GB      │   │50GB     │ │50GB     │
-   │          │   │         │ │         │
-   │Output:   │   │Output:  │ │Output:  │
-   │P0,P1,P2  │   │P3,P4,P5 │ │P6,P7,P8 │
-   └──────────┘   └─────────┘ └─────────┘
-        │               │          │
-        └───────────────┴──────────┘
-       Worker-to-Worker Shuffle
-       (gRPC Streaming)
-```
-
-### 3.2 5-Phase 실행 흐름
-
-```
-Phase 0: Initialization
-  ├─ Master 시작, Worker들 등록 대기
-  ├─ 각 Worker 시작, Master에 연결
-  ├─ Master가 Worker에 index 할당
-  └─ 디스크 공간 검증
-
-Phase 1: Sampling
-  ├─ 각 Worker가 입력 데이터에서 샘플 추출
-  ├─ 동적 샘플링 비율 계산 (0.01% ~ 1%)
-  ├─ Master에게 샘플 전송
-  ├─ Master가 전체 샘플 정렬
-  ├─ 파티션 경계 계산 (N개 or M개)
-  └─ shuffleMap 생성 및 브로드캐스트
-
-Phase 2: Sort & Partition
-  ├─ 각 Worker가 입력 파일 읽기 (ASCII/Binary 자동 처리)
-  ├─ Chunk 단위 메모리 내 정렬 (병렬)
-  ├─ 파티션 경계에 따라 분할 (N개 또는 M개)
-  └─ 파티션별 임시 파일 생성
-
-Phase 3: Shuffle
-  ├─ shuffleMap에 따라 파티션 전송
-  ├─ Worker 간 네트워크 통신 (gRPC streaming)
-  ├─ 재시도 로직 (지수 백오프)
-  └─ 수신 확인 및 임시 저장
-
-Phase 4: Merge
-  ├─ 각 Worker가 받은 파티션들을 개별적으로 K-way merge
-  ├─ Priority Queue (min-heap) 사용
-  ├─ 최종 partition.n 파일 생성
-  └─ Atomic write 보장 (temp + rename)
-
-Phase 5: Completion
-  ├─ 각 Worker가 Master에게 완료 보고
-  ├─ Master가 전체 작업 완료 확인
-  ├─ Master가 정렬된 Worker 주소 출력 (stdout)
-  └─ 임시 파일 정리
-```
-
-### 3.3 레코드 구조
-
-```
-┌──────────────┬────────────────────────────────────────┐
-│ Key (10B)    │ Value (90B)                            │
-└──────────────┴────────────────────────────────────────┘
-  0            10                                      100
-
-특징:
-- 고정 길이: 100 바이트
-- Key만 정렬 기준으로 사용 (unsigned 비교)
-- Value는 정렬과 무관하게 Key와 함께 이동
-```
-
-### 3.4 파티션 전략 (N→M Strategy)
-
-**PDF 요구사항**:
-> "numPartitions - 파티션 개수 (일반적으로 워커 수와 동일 **또는 배수**)"
-
-#### Strategy B: Advanced (N Workers → M Partitions, M > N)
-
-**개념**:
-- 파티션 수 > Worker 수 (일반적으로 M = 3N)
-- 각 Worker는 **여러 파티션**을 담당
-- Partition i는 Worker (i / partitionsPerWorker)가 담당
-
-**예시: 3 Workers, 9 Partitions**
-
-```
-Phase 2: Sort & Partition
-  Worker 0, 1, 2 각각 → P0~P8 (9개) 생성
-
-Phase 3: Shuffle
-  P0, P1, P2 → Worker 0
-  P3, P4, P5 → Worker 1
-  P6, P7, P8 → Worker 2
-
-Phase 4: Merge
-  Worker 0:
-    - 3개 P0 조각 merge → partition.0
-    - 3개 P1 조각 merge → partition.1
-    - 3개 P2 조각 merge → partition.2
-
-최종 출력:
-  /worker0/output/partition.0  ← 가장 작은 key
-  /worker0/output/partition.1
-  /worker0/output/partition.2
-  /worker1/output/partition.3
-  /worker1/output/partition.4
-  /worker1/output/partition.5
-  /worker2/output/partition.6
-  /worker2/output/partition.7
-  /worker2/output/partition.8  ← 가장 큰 key
-
-읽기 순서: partition.0 → 1 → 2 → ... → 8 = 전역 정렬됨
-```
-
-**장점**:
-- ✅ 로드 밸런싱 개선 (파티션 수 증가)
-- ✅ 멀티코어 활용 증가 (병렬 merge)
-- ✅ 파티션 크기 불균형 완화
-- ✅ PDF 요구사항 충족
-
----
-
-## 4. 핵심 설계 결정 사항
-
-### 4.1 Fault Tolerance: Checkpoint-based Recovery
-
-**PDF 요구사항**:
-> "The system must be fault-tolerant, which means that if a worker crashes and restarts, the overall computation should still produce correct results."
-
-#### 실제 구현 전략: Checkpoint-based Recovery
-
-```
-┌─────────────────────────────────────────────────┐
-│ Fault Tolerance Strategy (실제 구현)            │
-├─────────────────────────────────────────────────┤
-│ Checkpoint 저장:                                │
-│   ✅ 각 Phase 완료 시 자동 저장                  │
-│   ✅ WorkerState를 JSON으로 영속화               │
-│   ✅ 위치: /tmp/distsort/checkpoints/           │
-│   ✅ 최근 3개 checkpoint 유지                    │
-│                                                 │
-│ Worker Crash & Restart:                         │
-│   ✅ 시작 시 최신 checkpoint 로드                │
-│   ✅ 마지막 완료 Phase부터 재개                  │
-│   ✅ Sampling/Sort 재수행 불필요                 │
-│                                                 │
-│ Graceful Shutdown:                              │
-│   ✅ 30초 grace period                          │
-│   ✅ 현재 Phase 완료 대기                        │
-│   ✅ Checkpoint 저장 후 종료                     │
-│                                                 │
-│ Data Integrity:                                 │
-│   ✅ Atomic writes (temp + rename)              │
-│   ✅ State-based cleanup on failure             │
-│   ✅ Idempotent operations                      │
-└─────────────────────────────────────────────────┘
-```
-
-#### CheckpointManager 구현
-
-**저장되는 상태 (WorkerState)**:
-```scala
-case class WorkerState(
-  processedRecords: Long,              // 처리한 레코드 수
-  partitionBoundaries: List[Array[Byte]],  // 파티션 경계
-  shuffleMap: Map[Int, Int],           // 파티션 → Worker 매핑
-  completedPartitions: Set[Int],       // 완료한 파티션들
-  currentFiles: List[String],          // 현재 파일들
-  phaseMetadata: Map[String, String]   // Phase 메타데이터
-)
-```
-
-**Checkpoint 저장 시점**:
-```scala
-performSampling()
-  → savePhaseCheckpoint(PHASE_SAMPLING, 1.0)       // ✅
-
-getPartitionConfiguration()
-  → savePhaseCheckpoint(PHASE_WAITING_FOR_PARTITIONS, 1.0)  // ✅
-
-performLocalSort()
-  → savePhaseCheckpoint(PHASE_SORTING, 1.0)        // ✅
-
-performShuffle()
-  → savePhaseCheckpoint(PHASE_SHUFFLING, 1.0)      // ✅
-
-performMerge()
-  → savePhaseCheckpoint(PHASE_MERGING, 1.0)        // ✅
-  → checkpointManager.deleteAllCheckpoints()       // 성공 시 삭제
-```
-
-#### 복구 시나리오 예시
-
-```
-Worker crash during Shuffle:
-  Last checkpoint: PHASE_SORTING (100% 완료)
-
-Worker restart:
-  1. recoverFromCheckpoint() 성공
-  2. currentPhase = PHASE_SORTING (복원)
-  3. performShuffle() 재시작
-     ⭐ Sampling/Sort는 스킵 (시간 대폭 절약)
-  4. Merge → 완료
-
-Result:
-  ✅ 마지막 완료 Phase부터 재개
-  ✅ 빠른 복구 (전체 재시작 대비)
-  ✅ 정확성 보장
-```
-
-#### 정당화 (Justification)
-
-| 근거 | 설명 |
-|------|------|
-| **빠른 복구** | 마지막 완료 Phase부터 재개 → 전체 재시작보다 효율적 |
-| **정확성 보장** | Phase별 완료 checkpoint → 부분 결과 유실 없음 |
-| **실제 시스템** | Spark (RDD lineage + checkpoint), Flink (checkpoint 기반 exactly-once), MapReduce (Task-level restart) |
-| **구현 가능성** | CheckpointManager + JSON 직렬화 + Graceful Shutdown 통합 |
-| **PDF 해석** | "produce correct results" ← Checkpoint가 정확성과 효율성 모두 충족 |
-
-### 4.2 N→M Partition Strategy
-
-**목적**: Merge 단계에서 멀티코어 활용
-
-#### shuffleMap 생성 로직
-
-```scala
-def createShuffleMap(numWorkers: Int, numPartitions: Int): Map[Int, Int] = {
-  val shuffleMap = mutable.Map[Int, Int]()
-  val partitionsPerWorker = numPartitions / numWorkers
-
-  for (partitionID <- 0 until numPartitions) {
-    // 파티션 ID를 Worker ID로 매핑
-    val workerID = partitionID / partitionsPerWorker
-    val finalWorkerID = if (workerID >= numWorkers) numWorkers - 1 else workerID
-    shuffleMap(partitionID) = finalWorkerID
-  }
-
-  shuffleMap.toMap
-}
-
-// 예시
-// createShuffleMap(3, 9)
-//   → {0→0, 1→0, 2→0, 3→1, 4→1, 5→1, 6→2, 7→2, 8→2}
-//
-// 결과: Worker 0 = [0,1,2], Worker 1 = [3,4,5], Worker 2 = [6,7,8]
-//       각 Worker는 연속된 partition 번호 담당
-```
-
-#### 파티션 할당 공식 (Range-based)
-
-```scala
-def assignWorker(partitionID: Int, numWorkers: Int, numPartitions: Int): Int = {
-  val partitionsPerWorker = numPartitions / numWorkers
-  val workerID = partitionID / partitionsPerWorker
-  if (workerID >= numWorkers) numWorkers - 1 else workerID
-}
-```
-
-### 4.3 ASCII/Binary 자동 감지
-
-**PDF 요구사항**:
-> "Should work on both ASCII and binary input **without requiring an option**"
-
-#### InputFormatDetector 알고리즘
-
-```scala
-object InputFormatDetector {
-  private val SAMPLE_SIZE = 1000      // 파일의 첫 1000 바이트 분석
-  private val ASCII_THRESHOLD = 0.9   // 90% 이상 ASCII → ASCII 형식
-
-  def detectFormat(file: File): DataFormat = {
-    val buffer = new Array[Byte](SAMPLE_SIZE)
-    val inputStream = new FileInputStream(file)
-
-    try {
-      val bytesRead = inputStream.read(buffer)
-
-      if (bytesRead <= 0) {
-        logger.warn(s"Empty file: ${file.getName}, defaulting to Binary")
-        return DataFormat.Binary
-      }
-
-      // ASCII printable: 0x20-0x7E, plus \n (0x0A), \r (0x0D)
-      val asciiLikeCount = buffer.take(bytesRead).count { b =>
-        (b >= 32 && b <= 126) || b == '\n' || b == '\r'
-      }
-
-      val asciiRatio = asciiLikeCount.toDouble / bytesRead
-
-      if (asciiRatio > ASCII_THRESHOLD) {
-        DataFormat.Ascii
-      } else {
-        DataFormat.Binary
-      }
-    } finally {
-      inputStream.close()
-    }
-  }
-}
-```
-
-**혼합 입력 처리**:
-- 각 파일마다 독립적으로 형식 감지
-- ASCII와 Binary 파일 혼재 가능
-- RecordReader Factory Pattern으로 동적 생성
-
-### 4.4 External Sort (2-Pass Algorithm)
-
-**목적**: 메모리보다 큰 데이터 정렬
-
-#### Phase 1: Chunk Sort (병렬)
-
-```scala
-class ExternalSorter(numThreads: Int = Runtime.getRuntime.availableProcessors()) {
-  private val executor = Executors.newFixedThreadPool(numThreads)
-
-  def sortInParallel(inputFile: File, chunkSize: Long): List[File] = {
-    val chunks = splitIntoChunks(inputFile, chunkSize)
-
-    val futures = chunks.map { chunk =>
-      Future {
-        // 메모리 내 정렬
-        val records = readChunk(chunk).toArray
-        records.sortInPlace()
-        writeSortedChunk(records)
-      }(ExecutionContext.fromExecutor(executor))
-    }
-
-    Await.result(Future.sequence(futures), Duration.Inf)
-  }
-}
-```
-
-#### Phase 2: K-way Merge (Priority Queue)
-
-```scala
-def kWayMerge(sortedFiles: List[File], output: File): Unit = {
-  // Min-heap for K-way merge
-  val heap = mutable.PriorityQueue[RecordWithSource]()(
-    Ordering.by[RecordWithSource, Array[Byte]](_.record.key).reverse
-  )
-
-  // 각 파일에서 첫 레코드 읽기
-  readers.zipWithIndex.foreach { case (reader, idx) =>
-    reader.readRecord().foreach { record =>
-      heap.enqueue(RecordWithSource(record, idx))
-    }
-  }
-
-  // Merge
-  while (heap.nonEmpty) {
-    val min = heap.dequeue()
-    outputWriter.write(min.record)
-
-    // 같은 소스에서 다음 레코드 읽기
-    readers(min.sourceId).readRecord().foreach { record =>
-      heap.enqueue(RecordWithSource(record, min.sourceId))
-    }
-  }
-}
-```
-
-### 4.5 gRPC 기반 통신
-
-#### Protocol Buffers 정의 (핵심 부분)
-
-```protobuf
-syntax = "proto3";
-
-service MasterService {
-  rpc RegisterWorker(WorkerInfo) returns (RegistrationResponse);
-  rpc SendSample(SampleData) returns (Ack);
-  rpc NotifyPhaseComplete(PhaseCompleteRequest) returns (Ack);
-}
-
-service WorkerService {
-  rpc SetPartitionBoundaries(PartitionConfig) returns (Ack);
-  rpc ShuffleData(stream ShuffleDataChunk) returns (ShuffleAck);
-  rpc StartShuffle(ShuffleSignal) returns (Ack);
-  rpc StartMerge(MergeSignal) returns (Ack);
-}
-
-message PartitionConfig {
-  repeated bytes boundaries = 1;       // N-1 or M-1 개의 경계
-  int32 num_partitions = 2;            // N or M
-  map<int32, int32> shuffle_map = 3;   // partitionID → workerID
-  repeated WorkerInfo all_workers = 4;
-}
-
-message ShuffleDataChunk {
-  int32 partition_id = 1;
-  bytes data = 2;               // 1MB 청크 단위
-  int64 chunk_offset = 3;
-  bool is_last = 4;
-}
-```
-
-#### Shuffle 재시도 로직
-
-```scala
-def sendPartitionWithRetry(
-    partitionFile: File,
-    partitionId: Int,
-    targetWorker: WorkerInfo,
-    maxRetries: Int = 3): Unit = {
-
-  var attempt = 0
-  var success = false
-
-  while (attempt < maxRetries && !success) {
-    try {
-      sendPartition(partitionFile, partitionId, targetWorker)
-      success = true
-    } catch {
-      case e: StatusRuntimeException if isRetryable(e) =>
-        attempt += 1
-        val backoffMs = math.pow(2, attempt).toLong * 1000  // 지수 백오프
-        logger.warn(s"Send failed (attempt $attempt/$maxRetries), " +
-                   s"retrying in ${backoffMs}ms")
-        Thread.sleep(backoffMs)
-
-      case e: Exception =>
-        logger.error(s"Non-retryable error: ${e.getMessage}")
-        throw e
-    }
-  }
-}
-```
+| Record | 5 tests | ✅ 완료 (Week 4) |
+| RecordReader (Binary) | 📋 설계 | 예정 (Week 6) |
+| RecordReader (ASCII) | 📋 설계 | 예정 (Week 6) |
+| InputFormatDetector | 📋 설계 | 예정 (Week 6) |
+| FileLayout | 📋 설계 | 예정 (Week 6) |
+| ExternalSorter | 📋 설계 | 예정 (Week 6) |
+| KWayMerger | 📋 설계 | 예정 (Week 6) |
 
 ---
 
@@ -647,259 +842,52 @@ def sendPartitionWithRetry(
 Week 1-2: 설계 단계 (100% 완료)
   ├─ 시스템 아키텍처 정의
   ├─ Protocol Buffers 설계
-  ├─ Fault Tolerance 전략 결정
+  ├─ Fault Tolerance 전략 결정 (Checkpoint)
   └─ 7개 설계 문서 작성
 
 Week 3: 프로젝트 구조 및 Record (100% 완료)
   ├─ SBT 프로젝트 구조 생성
   ├─ gRPC stub 생성
-  └─ Record 클래스 구현 및 테스트
+  └─ Record 클래스 구현 및 테스트 (5/5 passing)
 
 Week 4-5: Core I/O Components (100% 완료)
-  ├─ RecordReader 추상화
-  ├─ BinaryRecordReader 구현
-  ├─ AsciiRecordReader 구현
-  ├─ InputFormatDetector 구현
-  ├─ FileLayout 클래스 구현
-  └─ RecordWriter 구현
+  ├─ RecordReader 추상화 (Factory Pattern)
+  ├─ BinaryRecordReader (100-byte 고정 길이)
+  ├─ AsciiRecordReader (102-byte: key+space+value+newline)
+  ├─ InputFormatDetector (자동 형식 감지)
+  ├─ FileLayout (파일 시스템 관리)
+  └─ RecordWriter (Binary/ASCII 출력)
 
-Week 6: Algorithms (예정)
-  📋 ExternalSorter
-  📋 Partitioner
-  📋 KWayMerger
+Week 5: Algorithms (100% 완료) ⭐ 실제로는 완료됨
+  ├─ ExternalSorter (2-Pass External Sort)
+  ├─ Partitioner (Range-based partitioning)
+  └─ KWayMerger (Priority Queue 기반 병합)
 
-Week 7-8: Master/Worker Integration (예정)
+Week 6: Master/Worker 구현 (진행 중)
   📋 Master 구현
   📋 Worker 구현
   📋 Phase 동기화
+  📋 Checkpoint 통합
+
+Week 7-8: 통합 테스트 (예정)
+  📋 전체 시스템 테스트
   📋 Fault Tolerance 검증
+  📋 최적화
 ```
 
-### 5.2 구현 완료 항목 (Week 4-5)
+### 5.2 구현 완료 항목 상세
 
-#### ✅ 1. RecordReader 추상화
-
-**목적**: ASCII/Binary 형식을 통일된 인터페이스로 처리
+#### ✅ 1. Record 클래스 (Week 4)
 
 ```scala
-// 추상 인터페이스
-trait RecordReader {
-  def readRecord(input: InputStream): Option[Array[Byte]]
-}
-
-// Factory Pattern
-object RecordReader {
-  def create(format: DataFormat): RecordReader = format match {
-    case DataFormat.Binary => new BinaryRecordReader()
-    case DataFormat.Ascii  => new AsciiRecordReader()
-  }
-}
-
-sealed trait DataFormat
-object DataFormat {
-  case object Binary extends DataFormat
-  case object Ascii extends DataFormat
-}
-```
-
-#### ✅ 2. BinaryRecordReader 구현
-
-**특징**:
-- 100-byte 고정 길이 읽기
-- BufferedInputStream 사용 (1MB 버퍼)
-- EOF 처리
-
-```scala
-class BinaryRecordReader extends RecordReader {
-  override def readRecord(input: InputStream): Option[Array[Byte]] = {
-    val record = new Array[Byte](100)
-    val bytesRead = input.read(record)
-
-    if (bytesRead == 100) {
-      Some(record)
-    } else if (bytesRead == -1) {
-      None  // EOF
-    } else {
-      throw new IOException(s"Incomplete record: $bytesRead bytes")
-    }
-  }
-}
-```
-
-#### ✅ 3. AsciiRecordReader 구현
-
-**ASCII 형식**:
-```
-key(10 chars) + space(1) + value(90 chars) + newline(1) = 102 bytes
-```
-
-```scala
-class AsciiRecordReader extends RecordReader {
-  override def readRecord(input: InputStream): Option[Array[Byte]] = {
-    val line = new Array[Byte](102)
-    val bytesRead = input.read(line)
-
-    if (bytesRead == -1) return None
-    if (bytesRead != 102)
-      throw new IOException(s"Invalid ASCII record: $bytesRead bytes")
-    if (line(10) != ' '.toByte)
-      throw new IOException("Expected space at position 10")
-    if (line(101) != '\n'.toByte)
-      throw new IOException("Expected newline at position 101")
-
-    // 100 bytes로 변환 (space와 newline 제거)
-    val record = new Array[Byte](100)
-    System.arraycopy(line, 0, record, 0, 10)     // key
-    System.arraycopy(line, 11, record, 10, 90)   // value
-
-    Some(record)
-  }
-}
-```
-
-#### ✅ 4. InputFormatDetector 구현
-
-**동작 원리**:
-1. 파일의 첫 1000 바이트 읽기
-2. ASCII printable 문자 비율 계산
-3. 비율 > 90% → ASCII, 그 외 → Binary
-
-**장점**:
-- ✅ PDF 요구사항 충족: "without requiring an option"
-- ✅ 각 파일마다 독립적 감지 (혼합 입력 지원)
-- ✅ 빠른 판별 (1000 bytes만 읽음)
-
-#### ✅ 5. FileLayout 클래스
-
-**역할**: 파일 시스템 관리 및 디스크 공간 검증
-
-```scala
-class FileLayout(
-  inputDirs: List[File],
-  outputDir: File,
-  tempBaseDir: File,
-  workerId: String
-) {
-  // 입력 디렉토리 검증 (읽기 전용)
-  def validateInputDirectories(): Unit = {
-    inputDirs.foreach { dir =>
-      require(dir.exists(), s"Input directory not found: $dir")
-      require(dir.isDirectory, s"Not a directory: $dir")
-      require(dir.canRead, s"Cannot read directory: $dir")
-    }
-  }
-
-  // 임시 디렉토리 생성
-  def createTemporaryStructure(): Unit = {
-    val workDir = new File(tempBaseDir, s"sort_work_$workerId")
-    val subdirs = List("samples", "sorted_chunks", "partitions", "received")
-
-    subdirs.foreach { subdir =>
-      val dir = new File(workDir, subdir)
-      if (!dir.exists()) dir.mkdirs()
-    }
-  }
-
-  // 디스크 공간 확인 (필요 공간 = inputSize * 2)
-  def ensureSufficientDiskSpace(): Unit = {
-    val totalInputSize = inputDirs.map(calculateDirSize).sum
-    val requiredTemp = totalInputSize * 2
-    val availableTemp = tempBaseDir.getUsableSpace
-
-    require(availableTemp > requiredTemp * 1.5,
-      s"Insufficient temp space: need ${requiredTemp * 1.5 / 1e9}GB")
-  }
-
-  // 임시 파일 정리
-  def cleanupTemporaryFiles(): Unit = {
-    val workDir = new File(tempBaseDir, s"sort_work_$workerId")
-    if (workDir.exists()) {
-      FileUtils.deleteRecursively(workDir)
-    }
-  }
-}
-```
-
-**PDF 요구사항 충족**:
-- ✅ 입력 디렉토리 보호 (읽기 전용, 수정 금지)
-- ✅ 임시 파일과 출력 파일 분리
-- ✅ 작업 완료 후 자동 정리
-
-#### ✅ 6. RecordWriter 구현
-
-**특징**:
-- Binary/ASCII 형식 출력 지원
-- 버퍼링 (4MB) for I/O 최적화
-- Atomic write (temp + rename)
-
-```scala
-class RecordWriter(outputFile: File, format: DataFormat) {
-  private val tempFile = new File(outputFile.getParent,
-                                  s".${outputFile.getName}.tmp")
-  private val output = new BufferedOutputStream(
-    new FileOutputStream(tempFile),
-    4 * 1024 * 1024  // 4MB 버퍼
-  )
-
-  def writeRecord(record: Array[Byte]): Unit = {
-    require(record.length == 100, s"Invalid record length: ${record.length}")
-
-    format match {
-      case DataFormat.Binary =>
-        output.write(record)
-
-      case DataFormat.Ascii =>
-        // key(10) + space + value(90) + newline
-        output.write(record, 0, 10)
-        output.write(' '.toByte)
-        output.write(record, 10, 90)
-        output.write('\n'.toByte)
-    }
-  }
-
-  def close(): Unit = {
-    output.close()
-
-    // Atomic rename
-    if (!tempFile.renameTo(outputFile)) {
-      throw new IOException(s"Failed to rename $tempFile to $outputFile")
-    }
-  }
-}
-```
-
----
-
-## 6. 구현 상세 (Week 4-5)
-
-### 6.1 실제 구현 코드 분석
-
-#### Record 클래스 (Week 4 완료)
-
-**파일**: `distsort/core/Record.scala`
-
-```scala
-package distsort.core
-
-/**
- * Represents a 100-byte record with 10-byte key and 90-byte value.
- *
- * Key comparison uses unsigned byte ordering, which is critical for
- * correct sorting behavior (e.g., 0xFF > 0x01).
- */
 case class Record(key: Array[Byte], value: Array[Byte]) extends Ordered[Record] {
-  require(key.length == 10, s"Key must be 10 bytes, got ${key.length}")
-  require(value.length == 90, s"Value must be 90 bytes, got ${value.length}")
+  require(key.length == 10)
+  require(value.length == 90)
 
-  /**
-   * Compare this record to another by key only (unsigned).
-   *
-   * @return negative if this < that, 0 if equal, positive if this > that
-   */
   override def compare(that: Record): Int = {
     var i = 0
     while (i < 10) {
-      val unsigned1 = this.key(i) & 0xFF  // Convert signed to unsigned
+      val unsigned1 = this.key(i) & 0xFF  // ⭐ Unsigned 변환
       val unsigned2 = that.key(i) & 0xFF
       val diff = unsigned1 - unsigned2
       if (diff != 0) return diff
@@ -908,360 +896,193 @@ case class Record(key: Array[Byte], value: Array[Byte]) extends Ordered[Record] 
     0
   }
 
-  /** Serialize to 100 bytes */
   def toBytes: Array[Byte] = key ++ value
-
-  /** Create a copy with the same data */
-  def copy(): Record = Record(key.clone(), value.clone())
-
-  override def toString: String = {
-    val keyHex = key.take(3).map("%02X".format(_)).mkString("")
-    s"Record(key=$keyHex..., value=${value.length}B)"
-  }
-
-  override def equals(obj: Any): Boolean = obj match {
-    case that: Record =>
-      java.util.Arrays.equals(this.key, that.key) &&
-      java.util.Arrays.equals(this.value, that.value)
-    case _ => false
-  }
-
-  override def hashCode(): Int = {
-    java.util.Arrays.hashCode(key)
-  }
 }
 ```
 
-**주요 포인트**:
-1. **Unsigned 비교 필수**: `& 0xFF`로 signed → unsigned 변환
-2. **불변성**: case class로 immutability 보장
-3. **문서화**: Scaladoc으로 모든 public method 설명
+**테스트**: 5/5 passing
 
-#### InputFormatDetector (Week 5 완료)
-
-**파일**: `distsort/core/InputFormatDetector.scala`
+#### ✅ 2. InputFormatDetector (Week 5)
 
 ```scala
-package distsort.core
-
-import java.io.{File, FileInputStream}
-import org.slf4j.LoggerFactory
-
-/**
- * Automatically detects whether a file is ASCII or Binary format.
- *
- * Algorithm:
- *   1. Read first 1000 bytes of the file
- *   2. Count ASCII printable characters
- *   3. If ratio > 90%, classify as ASCII; otherwise Binary
- *
- * This satisfies the PDF requirement:
- * "Should work on both ASCII and binary input without requiring an option"
- */
 object InputFormatDetector {
-  private val logger = LoggerFactory.getLogger(getClass)
-
   private val SAMPLE_SIZE = 1000
   private val ASCII_THRESHOLD = 0.9
 
-  /**
-   * Detect the format of a file.
-   *
-   * @param file The file to analyze
-   * @return DataFormat.Ascii or DataFormat.Binary
-   */
   def detectFormat(file: File): DataFormat = {
     val buffer = new Array[Byte](SAMPLE_SIZE)
-    val inputStream = new FileInputStream(file)
+    // 첫 1000 bytes 읽기
+    val bytesRead = inputStream.read(buffer)
 
-    try {
-      val bytesRead = inputStream.read(buffer)
+    // ASCII 비율 계산
+    val asciiCount = buffer.take(bytesRead).count(isAsciiPrintable)
+    val asciiRatio = asciiCount.toDouble / bytesRead
 
-      if (bytesRead <= 0) {
-        logger.warn(s"Empty file: ${file.getName}, defaulting to Binary")
-        return DataFormat.Binary
-      }
-
-      val asciiCount = buffer.take(bytesRead).count(isAsciiPrintable)
-      val asciiRatio = asciiCount.toDouble / bytesRead
-
-      logger.debug(s"File: ${file.getName}, ASCII ratio: $asciiRatio")
-
-      if (asciiRatio > ASCII_THRESHOLD) {
-        logger.info(s"Detected ASCII format for file: ${file.getName}")
-        DataFormat.Ascii
-      } else {
-        logger.info(s"Detected Binary format for file: ${file.getName}")
-        DataFormat.Binary
-      }
-    } finally {
-      inputStream.close()
-    }
-  }
-
-  /**
-   * Check if a byte is ASCII printable or whitespace.
-   *
-   * @param b The byte to check
-   * @return true if printable or whitespace
-   */
-  private def isAsciiPrintable(b: Byte): Boolean = {
-    (b >= 32 && b <= 126) ||  // Printable ASCII (space to ~)
-    b == '\n' ||               // Newline
-    b == '\r'                  // Carriage return
+    if (asciiRatio > ASCII_THRESHOLD) DataFormat.Ascii
+    else DataFormat.Binary
   }
 }
 ```
 
-**설계 패턴**: Singleton Object (Utility)
+**해결**: Additional Requirement 1 (ASCII/Binary 자동 감지)
 
-#### BinaryRecordReader (Week 5 완료)
-
-**파일**: `distsort/core/BinaryRecordReader.scala`
+#### ✅ 3. RecordReader 추상화 (Week 5)
 
 ```scala
-package distsort.core
+trait RecordReader {
+  def readRecord(input: InputStream): Option[Array[Byte]]
+  def close(): Unit
+}
 
-import java.io.{BufferedInputStream, File, FileInputStream, InputStream, IOException}
-import org.slf4j.LoggerFactory
-
-/**
- * Reads 100-byte binary records from a file.
- *
- * Each record consists of:
- *   - 10 bytes: key
- *   - 90 bytes: value
- *
- * Uses BufferedInputStream with 1MB buffer for efficient I/O.
- */
-class BinaryRecordReader extends RecordReader {
-  private val logger = LoggerFactory.getLogger(getClass)
-  private var inputStream: Option[BufferedInputStream] = None
-
-  /**
-   * Open a file for reading.
-   *
-   * @param file The file to read
-   */
-  def open(file: File): Unit = {
-    close()  // Close previous stream if any
-
-    inputStream = Some(new BufferedInputStream(
-      new FileInputStream(file),
-      1024 * 1024  // 1MB buffer
-    ))
-
-    logger.debug(s"Opened binary file: ${file.getName}")
-  }
-
-  /**
-   * Read a single 100-byte record.
-   *
-   * @param input The input stream (typically BufferedInputStream)
-   * @return Some(record) if successful, None if EOF
-   * @throws IOException if incomplete record is encountered
-   */
-  override def readRecord(input: InputStream): Option[Array[Byte]] = {
-    val record = new Array[Byte](100)
-    val bytesRead = input.read(record)
-
-    if (bytesRead == 100) {
-      Some(record)
-    } else if (bytesRead == -1) {
-      None  // EOF
-    } else {
-      throw new IOException(
-        s"Incomplete binary record: expected 100 bytes, got $bytesRead"
-      )
+object RecordReader {
+  def create(file: File): RecordReader = {
+    val format = InputFormatDetector.detectFormat(file)
+    format match {
+      case DataFormat.Binary => new BinaryRecordReader()
+      case DataFormat.Ascii  => new AsciiRecordReader()
     }
-  }
-
-  /**
-   * Close the input stream.
-   */
-  def close(): Unit = {
-    inputStream.foreach { stream =>
-      stream.close()
-      logger.debug("Closed binary reader")
-    }
-    inputStream = None
   }
 }
 ```
 
-**최적화**:
-- BufferedInputStream: I/O 호출 횟수 대폭 감소
-- Buffer 크기 1MB: 경험적으로 최적
+**BinaryRecordReader**: 100-byte 고정 길이
+**AsciiRecordReader**: 102-byte (key + space + value + newline)
 
-### 6.2 FileLayout 상세 구현
-
-**파일**: `distsort/core/FileLayout.scala` (일부)
+#### ✅ 4. FileLayout (Week 5)
 
 ```scala
-/**
- * Manages file system layout for distributed sorting.
- *
- * Directory structure:
- *   Input:  /data1/input/       (read-only, never modified)
- *   Output: /home/gla/data/     (final partition.* files only)
- *   Temp:   /tmp/sort_work_W0/  (intermediate files, auto-deleted)
- *
- * This class ensures:
- *   1. Input directories are never modified (PDF requirement)
- *   2. Temp and output directories are separate
- *   3. Sufficient disk space before starting
- *   4. Automatic cleanup on completion
- */
 class FileLayout(
-    inputDirs: List[File],
-    outputDir: File,
-    tempBaseDir: File,
-    workerId: String
+  inputDirs: List[File],    // 읽기 전용
+  outputDir: File,          // 최종 파일만
+  tempBaseDir: File         // 임시 파일
 ) {
-
-  private val logger = LoggerFactory.getLogger(getClass)
-  private val workTempDir = new File(tempBaseDir, s"sort_work_$workerId")
-
-  // Subdirectories
-  private val samplesDir = new File(workTempDir, "samples")
-  private val sortedChunksDir = new File(workTempDir, "sorted_chunks")
-  private val partitionsDir = new File(workTempDir, "partitions")
-  private val receivedDir = new File(workTempDir, "received")
-
-  /**
-   * Validate input directories (read-only access).
-   *
-   * CRITICAL: This method must NOT modify input directories!
-   */
-  def validateInputDirectories(): Unit = {
-    logger.info(s"Validating ${inputDirs.length} input directories")
-
-    inputDirs.foreach { dir =>
-      require(dir.exists(), s"Input directory not found: $dir")
-      require(dir.isDirectory, s"Not a directory: $dir")
-      require(dir.canRead, s"Cannot read directory: $dir")
-
-      // Count files
-      val fileCount = listFilesRecursively(dir).length
-      logger.info(s"  $dir: $fileCount files")
-    }
-  }
-
-  /**
-   * Create temporary directory structure.
-   */
-  def createTemporaryStructure(): Unit = {
-    logger.info(s"Creating temporary structure: $workTempDir")
-
-    List(samplesDir, sortedChunksDir, partitionsDir, receivedDir).foreach { dir =>
-      if (!dir.exists()) {
-        val created = dir.mkdirs()
-        require(created, s"Failed to create directory: $dir")
-        logger.debug(s"  Created: $dir")
-      }
-    }
-  }
-
-  /**
-   * Ensure sufficient disk space for sorting.
-   *
-   * Required space:
-   *   - Temp: 2x input size (intermediate files)
-   *   - Output: 1x input size (final partitions)
-   *
-   * Safety margin: 50% extra for temp
-   */
-  def ensureSufficientDiskSpace(): Unit = {
-    val totalInputSize = inputDirs.map(calculateDirSize).sum
-    val inputSizeGB = totalInputSize / 1e9
-
-    logger.info(f"Total input size: $inputSizeGB%.2f GB")
-
-    // Check temp space
-    val requiredTemp = totalInputSize * 2
-    val availableTemp = tempBaseDir.getUsableSpace
-    val requiredTempWithMargin = requiredTemp * 1.5
-
-    require(availableTemp > requiredTempWithMargin,
-      f"Insufficient temp space: available ${availableTemp / 1e9}%.2f GB, " +
-      f"required ${requiredTempWithMargin / 1e9}%.2f GB"
-    )
-
-    // Check output space
-    val availableOutput = outputDir.getUsableSpace
-    val requiredOutput = totalInputSize * 1.2
-
-    require(availableOutput > requiredOutput,
-      f"Insufficient output space: available ${availableOutput / 1e9}%.2f GB, " +
-      f"required ${requiredOutput / 1e9}%.2f GB"
-    )
-
-    logger.info("Disk space validation passed")
-  }
-
-  /**
-   * Calculate total size of a directory recursively.
-   */
-  private def calculateDirSize(dir: File): Long = {
-    if (!dir.exists()) return 0L
-
-    val files = listFilesRecursively(dir)
-    files.map(_.length()).sum
-  }
-
-  /**
-   * List all files in a directory recursively.
-   */
-  private def listFilesRecursively(dir: File): List[File] = {
-    if (!dir.exists() || !dir.isDirectory) return List.empty
-
-    val (files, subdirs) = dir.listFiles().toList.partition(_.isFile)
-    files ++ subdirs.flatMap(listFilesRecursively)
-  }
-
-  /**
-   * Clean up temporary files.
-   *
-   * This is called:
-   *   1. On worker startup (idempotent operation)
-   *   2. After successful completion
-   *   3. On error/crash recovery
-   */
-  def cleanupTemporaryFiles(): Unit = {
-    if (workTempDir.exists()) {
-      logger.info(s"Cleaning up temporary files: $workTempDir")
-      deleteRecursively(workTempDir)
-    }
-  }
-
-  /**
-   * Recursively delete a directory.
-   */
-  private def deleteRecursively(file: File): Unit = {
-    if (file.isDirectory) {
-      file.listFiles().foreach(deleteRecursively)
-    }
-    file.delete()
-  }
-
-  // Getters for subdirectories
-  def getSamplesDir: File = samplesDir
-  def getSortedChunksDir: File = sortedChunksDir
-  def getPartitionsDir: File = partitionsDir
-  def getReceivedDir: File = receivedDir
-  def getOutputDir: File = outputDir
+  def validateInputDirectories(): Unit
+  def createTemporaryStructure(): Unit
+  def ensureSufficientDiskSpace(): Unit
+  def cleanupTemporaryFiles(): Unit
 }
 ```
 
-### 6.3 코드 품질 지표
+**해결**:
+- Additional Requirement 2 (입력 보호)
+- Additional Requirement 3 (출력 정리)
+
+#### ✅ 5. ExternalSorter (Week 5)
+
+```scala
+class ExternalSorter(
+  fileLayout: FileLayout,
+  memoryLimit: Long = 512 * 1024 * 1024,  // 512 MB
+  numThreads: Int = Runtime.getRuntime.availableProcessors()
+) {
+  def createSortedChunksParallel(records: Seq[Record]): Seq[File] = {
+    val chunks = records.grouped(recordsPerChunk).toSeq
+
+    // 병렬 정렬
+    val futures = chunks.zipWithIndex.map { case (chunk, index) =>
+      Future {
+        val sorted = chunk.sorted
+        writeChunkToFile(sorted, chunkFile)
+        chunkFile
+      }
+    }
+
+    Await.result(Future.sequence(futures), Duration.Inf)
+  }
+}
+```
+
+**해결**: Challenge 1 (메모리 제한)
+
+#### ✅ 6. KWayMerger (Week 5)
+
+```scala
+class KWayMerger(sortedChunks: Seq[File]) {
+  def mergeWithCallback(callback: Record => Unit): Unit = {
+    val heap = mutable.PriorityQueue[HeapEntry]()
+
+    // Min-heap 기반 병합
+    while (heap.nonEmpty) {
+      val entry = heap.dequeue()
+      callback(entry.record)  // 스트리밍 처리
+
+      readers(entry.sourceIndex).readRecord() match {
+        case Some(nextRecord) =>
+          heap.enqueue(HeapEntry(nextRecord, entry.sourceIndex))
+        case None => // Source exhausted
+      }
+    }
+  }
+}
+```
+
+**해결**: Challenge 1 (디스크 기반 병합)
+
+#### ✅ 7. CheckpointManager (Week 5)
+
+```scala
+class CheckpointManager(workerId: String) {
+  def saveCheckpoint(
+    phase: WorkerPhase,
+    state: WorkerState,
+    progress: Double
+  ): Future[String] = {
+    val checkpoint = Checkpoint(checkpointId, workerId, phase.toString,
+                                 Instant.now(), progress, state)
+    // JSON으로 저장
+    writer.write(gson.toJson(checkpoint))
+    checkpointId
+  }
+
+  def loadLatestCheckpoint(): Option[Checkpoint] = {
+    // 가장 최근 checkpoint 로드
+    checkpointFiles.sortBy(_.lastModified()).reverse.headOption
+  }
+}
+```
+
+**해결**: Challenge 3 (Fault Tolerance)
+
+#### ✅ 8. Worker with Checkpoint Integration (Week 6)
+
+```scala
+class Worker(...) extends ShutdownAware {
+  private val checkpointManager = CheckpointManager(workerId)
+  private val shutdownManager = GracefulShutdownManager(...)
+
+  def run(): Unit = {
+    val recoveredFromCheckpoint = recoverFromCheckpoint()
+
+    if (!recoveredFromCheckpoint) {
+      performSampling()
+    }
+
+    // Phase별 checkpoint 저장
+    if (currentPhase == PHASE_SORTING) {
+      performLocalSort()
+      savePhaseCheckpoint(PHASE_SORTING, 1.0)
+
+      performShuffle()
+      savePhaseCheckpoint(PHASE_SHUFFLING, 1.0)
+    }
+
+    performMerge()
+    checkpointManager.deleteAllCheckpoints()
+  }
+}
+```
+
+**해결**: Challenge 3 (복구 메커니즘)
+
+### 5.3 코드 품질 지표
 
 **Week 4-5 기준**:
-- 총 코드 라인: ~800 LOC (Comments 포함 ~1200 LOC)
+- 총 코드 라인: ~2,000 LOC (Comments 포함 ~3,000 LOC)
 - 테스트 커버리지: Record 5/5 passing
 - 문서화: 모든 public method Scaladoc 작성
 - 코드 스타일: Scala 표준 가이드 준수
 
-### 6.4 해결한 기술적 문제
+### 5.4 해결한 기술적 문제
 
 #### 문제 1: Unsigned Byte 비교
 
@@ -1270,35 +1091,24 @@ class FileLayout(
 **해결**:
 ```scala
 // ❌ 잘못된 코드
-def compare(that: Record): Int = {
-  this.key(0).compareTo(that.key(0))  // Signed comparison
-}
-// 결과: 0xFF (-1 in signed) < 0x01 (1 in signed)
+this.key(0).compareTo(that.key(0))  // Signed: 0xFF = -1 < 0x01 = 1
 
 // ✅ 올바른 코드
-def compare(that: Record): Int = {
-  val unsigned1 = this.key(0) & 0xFF  // 0xFF → 255
-  val unsigned2 = that.key(0) & 0xFF  // 0x01 → 1
-  unsigned1 - unsigned2                // 255 - 1 = 254 > 0
-}
+val unsigned1 = this.key(0) & 0xFF  // Unsigned: 0xFF = 255 > 0x01 = 1
 ```
 
 #### 문제 2: Buffer의 clone() 누락
 
 **증상**: 같은 레코드가 반복해서 읽힘 (참조 공유)
 
-**원인**:
+**해결**:
 ```scala
 // ❌ 잘못된 코드
 val record = new Array[Byte](100)
 while (input.read(record) == 100) {
   records += record  // 같은 배열 참조!
 }
-// 결과: records에 같은 배열이 여러 번 들어감
-```
 
-**해결**:
-```scala
 // ✅ 올바른 코드
 val record = new Array[Byte](100)
 while (input.read(record) == 100) {
@@ -1313,132 +1123,11 @@ while (input.read(record) == 100) {
 - Threshold 0.95: ASCII 파일을 Binary로 오판
 - **Threshold 0.9**: 최적 (gensort 데이터로 검증)
 
-**최종 결정**: 0.9 (90%)
-
-#### 문제 4: 디스크 공간 부족 대비
-
-**전략**:
-1. 작업 시작 전 공간 검증
-2. 필요 공간 = inputSize * 2 (임시 파일 고려)
-3. 안전 여유 = 50% 추가
-4. 실패 시 명확한 에러 메시지
-
-### 6.5 구현 품질 관리
-
-#### 버퍼 크기 결정 근거
-
-**BinaryRecordReader: 1MB 버퍼**
-- 목적: I/O 호출 횟수 최소화
-- 근거: 일반적인 파일 시스템 블록 크기와 메모리 효율성 균형
-
-**RecordWriter: 4MB 버퍼**
-- 목적: 대용량 출력 시 I/O 효율 향상
-- 근거: 출력 파일이 더 크므로 버퍼 증가, 8MB 이상은 메모리 낭비 우려
-
 ---
 
-## 7. 향후 계획 (Week 6-8)
+## 6. 향후 계획 (Week 6-8)
 
-### 7.1 Week 6: Algorithms 구현
-
-#### 목표
-
-**ExternalSorter**, **Partitioner**, **KWayMerger** 구현
-
-#### 세부 계획
-
-##### ExternalSorter
-
-```scala
-class ExternalSorter(
-    chunkSize: Long = 100 * 1024 * 1024,  // 100MB
-    numThreads: Int = Runtime.getRuntime.availableProcessors()
-) {
-
-  /**
-   * Sort input file using 2-pass external sort.
-   *
-   * Phase 1: Split into chunks, sort each in parallel
-   * Phase 2: K-way merge all sorted chunks
-   */
-  def sort(inputFile: File, outputFile: File): Unit = {
-    // Phase 1: Chunk sort (parallel)
-    val sortedChunks = sortChunksInParallel(inputFile)
-
-    // Phase 2: K-way merge
-    kWayMerge(sortedChunks, outputFile)
-
-    // Cleanup
-    sortedChunks.foreach(_.delete())
-  }
-
-  private def sortChunksInParallel(inputFile: File): List[File] = {
-    // TDD: Test first!
-    ???
-  }
-}
-```
-
-##### Partitioner
-
-```scala
-class Partitioner(
-    boundaries: Array[Array[Byte]],
-    numPartitions: Int
-) {
-
-  /**
-   * Partition sorted chunks by range.
-   *
-   * Uses binary search to find partition ID for each record.
-   */
-  def partition(sortedChunk: File, outputDir: File): Map[Int, File] = {
-    // TDD: Test first!
-    ???
-  }
-
-  private def findPartitionBinarySearch(key: Array[Byte]): Int = {
-    // TDD: Test first!
-    ???
-  }
-}
-```
-
-##### KWayMerger
-
-```scala
-class KWayMerger {
-
-  /**
-   * Merge K sorted files into one using priority queue.
-   */
-  def merge(inputFiles: List[File], outputFile: File): Unit = {
-    // Min-heap
-    val heap = mutable.PriorityQueue[RecordWithSource]()(
-      Ordering.by[RecordWithSource, Array[Byte]](_.record.key).reverse
-    )
-
-    // TDD: Test first!
-    ???
-  }
-}
-```
-
-#### 검증 기준
-
-```bash
-# 테스트 데이터 생성
-gensort -b0 1000000 test_input.dat  # 100MB
-
-# 로컬 정렬 실행 (Worker 없이)
-sbt "runMain distsort.LocalSortTest test_input.dat test_output.dat"
-
-# 검증
-valsort test_output.dat
-# 예상: SUCCESS
-```
-
-### 7.2 Week 7: Master/Worker 구현
+### 6.1 Week 6: Master/Worker 통합 (진행 중)
 
 #### Master Node
 
@@ -1471,32 +1160,31 @@ valsort test_output.dat
   INITIALIZING → SAMPLING → SORTING → SHUFFLING → MERGING → COMPLETED
 ```
 
-### 7.3 Week 8: 통합 테스트 및 최적화
-
-#### 통합 테스트
+### 6.2 Week 7: 통합 테스트
 
 ```bash
-# Scenario 1: 3 workers, 3 partitions (Strategy A)
-$ ./test_3w3p.sh
-
-# Scenario 2: 3 workers, 9 partitions (Strategy B)
+# Scenario 1: 3 workers, 9 partitions (Strategy B)
 $ ./test_3w9p.sh
 
-# Scenario 3: Worker crash during shuffle
+# Scenario 2: Worker crash during shuffle
 $ ./test_fault_tolerance.sh
+
+# Scenario 3: ASCII/Binary 혼합 입력
+$ ./test_mixed_format.sh
 ```
 
-#### 최적화
+### 6.3 Week 8: 최적화 및 최종 검증
 
 - 멀티스레드 활용도 향상
 - 네트워크 대역폭 최적화
 - 디스크 I/O 병목 제거
+- valsort 검증 통과 확인
 
 ---
 
-## 8. Q&A 준비
+## 7. Q&A 준비
 
-### 8.1 예상 질문
+### 예상 질문
 
 #### Q1: "TDD를 선택한 이유는?"
 
@@ -1516,16 +1204,13 @@ $ ./test_fault_tolerance.sh
   - 빠른 복구 (전체 재시작 대비 시간 절약)
   - 정확성 보장 (Phase별 완료 시점 checkpoint)
   - Graceful Shutdown 통합 (30초 grace period)
-- **구현**: CheckpointManager + JSON 직렬화 + 최근 3개 유지
-- **PDF 요구사항**: "produce correct results" ← 정확성과 효율성 모두 충족
 
 #### Q3: "N→M 전략의 장점은?"
 
 **답변**:
 - 로드 밸런싱 개선: 파티션 수 증가로 크기 불균형 완화
 - 멀티코어 활용: 각 Worker가 여러 파티션 병렬 merge
-- PDF 요구사항 충족: "numPartitions는 워커 수와 동일 또는 배수"
-- 예: 3 workers, 9 partitions → 각 Worker가 3개 파티션 병렬 merge
+- 예: 4 workers, 12 partitions → 각 Worker가 3개 파티션 병렬 merge
 
 #### Q4: "ASCII/Binary 자동 감지는 어떻게 동작하나?"
 
@@ -1534,52 +1219,49 @@ $ ./test_fault_tolerance.sh
 - ASCII printable 문자 비율 계산
 - 비율 > 90% → ASCII, 그 외 → Binary
 - 각 파일마다 독립적 감지 → 혼합 입력 지원
-- PDF 요구사항: "without requiring an option"
 
 #### Q5: "현재 진행률은?"
 
 **답변**:
 - Week 1-2: 설계 단계 100% 완료
-- Week 3: Record 클래스 100% 완료
+- Week 3: Record 클래스 100% 완료 (5/5 tests passing)
 - Week 4-5: Core I/O Components 100% 완료
   - RecordReader, InputFormatDetector, FileLayout, RecordWriter
-- Week 6: Algorithms 구현 예정
-  - ExternalSorter, Partitioner, KWayMerger
-- Week 7-8: Master/Worker 통합 예정
+  - ExternalSorter, KWayMerger, CheckpointManager
+- Week 6: Master/Worker 통합 진행 중
 
-전체 진행률: 약 40% (설계 + 기초 컴포넌트 완료)
+**전체 진행률**: 약 60% (설계 + 핵심 컴포넌트 완료, Master/Worker 통합 진행 중)
 
-#### Q6: "가장 어려웠던 부분은?"
-
-**답변**:
-1. **Unsigned 비교**: Scala의 Byte가 signed → `& 0xFF`로 변환 필요
-2. **파티션 전략**: N→N vs N→M 선택, shuffleMap 로직 이해
-3. **Fault Tolerance**: 어디까지 복구 vs 재시작? → PDF 해석 + 구현 복잡도 고려
-
-#### Q7: "테스트는 어떻게 하나?"
+#### Q6: "External Sort가 메모리 제한을 어떻게 준수하나?"
 
 **답변**:
-- **Unit Tests**: 개별 함수/클래스 검증 (ScalaTest)
-  - 예: RecordSpec, RecordReaderSpec
-- **Integration Tests**: 컴포넌트 간 통신 검증
-  - 예: gRPC 통신, Shuffle 재시도
-- **E2E Tests**: 전체 시스템 검증
-  - 예: 3 workers로 100MB 데이터 정렬, valsort로 검증
-- **Fault Tolerance Tests**: Worker crash 시나리오
-  - 예: Shuffle 중 kill -9, 재시작 후 복구
+- `memoryLimit = 512MB` 설정
+- `recordsPerChunk = memoryLimit / 100` 계산
+- 예: 512MB ÷ 100 bytes = 5,242,880 records per chunk
+- 50GB 입력 → 약 100 chunks 생성
+- 각 chunk를 병렬로 정렬 → 디스크에 저장
+- K-way merge로 최종 병합 (스트리밍 처리)
 
-### 8.2 데모 시나리오 (Week 6 이후)
+#### Q7: "Challenge 1, 2, 3가 모두 해결되었나?"
+
+**답변**:
+- **Challenge 1 (메모리 제한)**: ✅ ExternalSorter + KWayMerger로 해결
+- **Challenge 2 (분산)**: ✅ Master-Worker + Shuffle로 해결
+- **Challenge 3 (Fault Tolerance)**: ✅ Checkpoint + Graceful Shutdown으로 해결
+- **Additional Requirements**: ✅ 모두 구현 완료
+
+### 데모 시나리오 (Week 7 이후)
 
 ```bash
 # 1. 테스트 데이터 생성
 $ gensort -b0 10000000 /data1/input/test.dat  # 1GB
 
-# 2. Master 시작 (3 workers, 9 partitions)
-$ sbt "runMain distsort.Main master 3 9"
+# 2. Master 시작 (4 workers, 12 partitions)
+$ sbt "runMain distsort.Main master 4 12"
 [INFO] Master started on port 30000
-[INFO] Waiting for 3 workers to register...
+[INFO] Waiting for 4 workers to register...
 
-# 3. Worker 시작 (3대)
+# 3. Worker 시작 (4대)
 $ sbt "runMain distsort.Main worker 192.168.1.1:30000 -I /data1/input -O /data1/output"
 [INFO] Worker registered with ID W0
 
@@ -1589,20 +1271,24 @@ $ sbt "runMain distsort.Main worker 192.168.1.1:30000 -I /data2/input -O /data2/
 $ sbt "runMain distsort.Main worker 192.168.1.1:30000 -I /data3/input -O /data3/output"
 [INFO] Worker registered with ID W2
 
+$ sbt "runMain distsort.Main worker 192.168.1.1:30000 -I /data4/input -O /data4/output"
+[INFO] Worker registered with ID W3
+
 # 4. Master 출력
 192.168.1.100:30000
-worker0, worker1, worker2
+worker0, worker1, worker2, worker3
 
 # 5. 결과 검증
-$ valsort /data1/output/partition.* /data2/output/partition.* /data3/output/partition.*
+$ valsort /data1/output/partition.* /data2/output/partition.* \
+          /data3/output/partition.* /data4/output/partition.*
 SUCCESS
 ```
 
 ---
 
-## 9. 참고 문헌
+## 8. 참고 문헌
 
-### 9.1 핵심 알고리즘
+### 8.1 핵심 알고리즘
 
 - Knuth, Donald E. *The Art of Computer Programming, Volume 3: Sorting and Searching*. Addison-Wesley, 1998.
   - External Sorting 알고리즘 (5.4절)
@@ -1610,22 +1296,22 @@ SUCCESS
 - TeraSort: A Sample Hadoop Application
   - Sampling for Partitioning 기법
 
-### 9.2 시스템 설계
+### 8.2 시스템 설계
 
 - Dean, Jeffrey, and Sanjay Ghemawat. "MapReduce: Simplified Data Processing on Large Clusters." *OSDI* 2004.
   - Master-Worker 아키텍처, Fault Tolerance 전략
 
 - Zaharia, Matei, et al. "Resilient Distributed Datasets: A Fault-Tolerant Abstraction for In-Memory Cluster Computing." *NSDI* 2012.
-  - Lineage-based Fault Recovery
+  - Checkpoint 기반 Fault Recovery
 
-### 9.3 구현 참고
+### 8.3 구현 참고
 
 - gRPC 공식 문서: https://grpc.io/docs/languages/scala/
 - Protocol Buffers: https://protobuf.dev/
 - **gensort/valsort**: http://www.ordinal.com/gensort.html
   - 정렬 테스트 데이터 생성 및 검증 도구
 
-### 9.4 프로젝트 문서
+### 8.4 프로젝트 문서
 
 - `plan/2025-10-24_plan_ver3.md`: 전체 시스템 설계
 - `docs/0-implementation-decisions.md`: 핵심 구현 결정 사항
@@ -1641,9 +1327,7 @@ SUCCESS
 
 ---
 
-## Appendix: 추가 자료
-
-### A.1 프로젝트 구조
+## Appendix: 프로젝트 구조
 
 ```
 project_2025/
@@ -1661,19 +1345,22 @@ project_2025/
 │       │   │   ├── AsciiRecordReader.scala    ✅ Week 5
 │       │   │   ├── InputFormatDetector.scala  ✅ Week 5
 │       │   │   ├── FileLayout.scala           ✅ Week 5
-│       │   │   └── RecordWriter.scala         ✅ Week 5
-│       │   ├── algorithms/
-│       │   │   ├── ExternalSorter.scala       📋 Week 6
-│       │   │   ├── Partitioner.scala          📋 Week 6
-│       │   │   └── KWayMerger.scala           📋 Week 6
+│       │   │   ├── RecordWriter.scala         ✅ Week 5
+│       │   │   ├── ExternalSorter.scala       ✅ Week 5
+│       │   │   ├── Partitioner.scala          ✅ Week 5
+│       │   │   └── KWayMerger.scala           ✅ Week 5
+│       │   ├── checkpoint/
+│       │   │   └── CheckpointManager.scala    ✅ Week 5
+│       │   ├── shutdown/
+│       │   │   └── GracefulShutdownManager.scala ✅ Week 6
 │       │   ├── master/
-│       │   │   ├── MasterServer.scala         📋 Week 7
-│       │   │   └── PhaseTracker.scala         📋 Week 7
+│       │   │   ├── MasterServer.scala         📋 Week 6
+│       │   │   └── PhaseTracker.scala         📋 Week 6
 │       │   └── worker/
-│       │       ├── WorkerNode.scala           📋 Week 7
-│       │       └── WorkerStateMachine.scala   📋 Week 7
+│       │       ├── Worker.scala               📋 Week 6
+│       │       └── WorkerService.scala        📋 Week 6
 │       └── protobuf/
-│           └── distsort.proto                 📋 Week 7
+│           └── distsort.proto                 📋 Week 6
 ├── docs/
 │   ├── 0-implementation-decisions.md
 │   ├── 1-phase-coordination.md
@@ -1682,45 +1369,4 @@ project_2025/
 │   └── 7-testing-strategy.md
 └── plan/
     └── 2025-10-24_plan_ver3.md
-```
-
-### A.2 개발 도구
-
-| 도구 | 버전 | 용도 |
-|------|------|------|
-| Scala | 2.13.12 | 구현 언어 |
-| SBT | 1.9.7 | 빌드 도구 |
-| gRPC | 1.59.1 | RPC 프레임워크 |
-| ScalaTest | 3.2.17 | 테스트 프레임워크 |
-| gensort | 1.5 | 테스트 데이터 생성 |
-| valsort | 1.5 | 정렬 결과 검증 |
-
-### A.3 Git Commit 전략
-
-```
-Commit Message 형식:
-  <type>: <subject>
-
-  <body>
-
-  Co-Authored-By: 권동연 <yeon903@github>
-  Co-Authored-By: 박범순 <pbs7818@github>
-  Co-Authored-By: 임지훈 <Jih00nLim@github>
-
-Type:
-  feat: 새로운 기능
-  fix: 버그 수정
-  docs: 문서 업데이트
-  test: 테스트 추가/수정
-  refactor: 리팩토링
-
-예시:
-  feat: Implement BinaryRecordReader with 1MB buffering
-
-  - Add BinaryRecordReader class
-  - Use BufferedInputStream for efficient I/O
-  - Handle EOF and incomplete records
-  - Add comprehensive error messages
-
-  Co-Authored-By: ...
 ```
