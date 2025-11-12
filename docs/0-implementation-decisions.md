@@ -14,19 +14,27 @@
 
 **핵심 질문**: "Worker crash & restart 후 어떻게 복구?"
 
-### 1.2 구현 결정: **Graceful Degradation with Job Restart**
+### 1.2 구현 결정: **Checkpoint-based Recovery**
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│ Fault Tolerance Strategy                                │
+│ Fault Tolerance Strategy (실제 구현)                    │
 ├─────────────────────────────────────────────────────────┤
-│ Phase 1-2 (Sampling/Sorting):                          │
-│   ✅ Continue with N-1 workers if >50% alive           │
-│   ✅ Recompute boundaries with remaining samples        │
+│ Checkpoint 저장:                                        │
+│   ✅ 각 Phase 완료 시 자동 저장                          │
+│   ✅ WorkerState를 JSON으로 영속화                       │
+│   ✅ 위치: /tmp/distsort/checkpoints/                   │
+│   ✅ 최근 3개 checkpoint 유지                            │
 │                                                         │
-│ Phase 3-4 (Shuffle/Merge):                             │
-│   ❌ Cannot continue - restart entire job               │
-│   ✅ Worker restarts and re-registers from beginning    │
+│ Worker Crash & Restart:                                 │
+│   ✅ 시작 시 최신 checkpoint 로드                        │
+│   ✅ 마지막 완료 Phase부터 재개                          │
+│   ✅ Sampling/Sort 재수행 불필요                         │
+│                                                         │
+│ Graceful Shutdown:                                      │
+│   ✅ 30초 grace period                                  │
+│   ✅ 현재 Phase 완료 대기                                │
+│   ✅ Checkpoint 저장 후 종료                             │
 │                                                         │
 │ Data Integrity:                                         │
 │   ✅ Atomic writes (temp + rename)                      │
@@ -37,117 +45,331 @@
 
 ### 1.3 정당화 (Justification)
 
-**왜 "전체 재시작"을 선택했나?**
+**왜 "Checkpoint 기반 복구"를 선택했나?**
 
-1. **구현 복잡도**: Partial recovery는 Lineage tracking + Checkpoint 필요 → 프로젝트 범위 초과
-2. **정확성 우선**: 부분 복구는 corner case가 많음 → 전체 재시작이 더 안전
+1. **빠른 복구**: 마지막 완료 Phase부터 재개 → 전체 재시작보다 효율적
+2. **정확성 보장**: Phase별 완료 checkpoint → 부분 결과 유실 없음
 3. **실제 시스템 사례**:
-   - Hadoop 초기 버전도 JobTracker SPOF였음
-   - 많은 batch processing 시스템이 job-level restart 사용
-4. **PDF 해석**: "produce correct results" ← 성능보다 정확성 강조
+   - Spark: RDD lineage + checkpoint 혼합
+   - Flink: Checkpoint 기반 exactly-once semantics
+   - MapReduce: Task-level restart (우리는 Worker-level)
+4. **구현 가능성**:
+   - CheckpointManager로 상태 관리
+   - JSON 직렬화로 간단한 영속화
+   - Graceful Shutdown과 통합
+5. **PDF 해석**: "produce correct results" ← Checkpoint가 정확성과 효율성 모두 충족
 
-### 1.4 Worker Restart 시나리오
+### 1.4 Worker Restart 시나리오 (Checkpoint 기반)
 
 ```
-시나리오 1: Worker crashes during Sampling (Phase 2)
+시나리오 1: Worker crashes during Sorting (Phase 3)
 ──────────────────────────────────────────────────────
 Before crash:
-  - 5 workers registered
-  - 3 workers submitted samples
-  - Worker 2 crashes
+  - Worker 2 is sorting local data (50% complete)
+  - Last checkpoint: PHASE_SAMPLING (100% complete)
+  - Worker 2 crashes (kill -9)
 
 Detection:
   - Master: No heartbeat from Worker 2 for 60s
-  - Master: Sampling phase timeout (10 min)
+  - Master: Marks Worker 2 as FAILED
 
 Recovery:
-  - Wait for remaining 4 workers to complete sampling
-  - If 4 ≥ 5 * 0.5 (YES):
-      → Continue with 4 workers
-      → Recompute boundaries with 4 samples
-      → Set numPartitions = 4
-  - Else:
-      → Abort job
+  Worker 2 restarts:
+    1. run() 호출
+    2. recoverFromCheckpoint() 성공
+       - Loads: checkpoint_1699999999_PHASE_SAMPLING.json
+       - Restores: partitionBoundaries, shuffleMap, etc.
+       - Sets currentPhase = PHASE_SAMPLING
 
-Worker 2 restarts:
-  - Tries to re-register
-  - Master rejects: "Registration closed, current job in progress"
-  - Worker 2 waits for next job
+    3. Phase별 체크:
+       if (currentPhase == PHASE_SAMPLING) {
+         getPartitionConfiguration()  // ✅ 이미 완료 (checkpoint에서)
+       }
+       if (currentPhase == PHASE_SORTING) {
+         performLocalSort()  // ⭐ 여기부터 재개 (Sampling 스킵)
+       }
+
+    4. Sorting 재시작 → Checkpoint 저장 (PHASE_SORTING 100%)
+    5. Shuffle → Merge → 완료
+
+Result:
+  ✅ Sampling 재수행 불필요 (10분 절약)
+  ✅ 정확성 보장 (checkpoint 상태에서 재개)
+  ✅ 다른 Worker 영향 없음
 ```
 
 ```
 시나리오 2: Worker crashes during Shuffle (Phase 4)
 ──────────────────────────────────────────────────────
 Before crash:
-  - Worker 2 is sending partition.5 to Worker 3
-  - Transfer is 50% complete
-  - Worker 2 crashes
+  - Worker 2 is sending partition.5 to Worker 3 (50% complete)
+  - Last checkpoint: PHASE_SORTING (100% complete)
+  - Worker 2 crashes (network failure)
 
 Detection:
-  - Worker 3: Partial file received, no completion signal
-  - Worker 3: Timeout after 60s, cleanup temp file
+  - Worker 3: Partial file received, timeout after 60s
+  - Worker 3: Cleanup incomplete temp file
   - Master: No heartbeat from Worker 2 for 60s
 
 Recovery:
-  ❌ Cannot continue:
-      - Worker 2 was responsible for partition.2
-      - partition.2 data is lost (only in Worker 2's temp dir)
-      - Other workers are waiting for partition.2
+  Worker 2 restarts:
+    1. recoverFromCheckpoint() 성공
+       - Loads: checkpoint_1700000000_PHASE_SORTING.json
+       - currentPhase = PHASE_SORTING
 
-Action:
-  - Master sends AbortRequest to all workers
-  - All workers cleanup temporary files
-  - Job restarts from Phase 1
+    2. Phase별 체크:
+       if (currentPhase == PHASE_SORTING) {
+         // Sorting already done (checkpoint)
+         performShuffle(sortedChunks)  // ⭐ Shuffle 재시작
+       }
 
-Worker 2 restarts:
-  - Re-registers for new job
-  - Starts from Phase 1 with all other workers
+    3. Shuffle 재시도:
+       - 정렬된 chunk 파일들은 이미 존재
+       - partitionBoundaries, shuffleMap 복원됨
+       - Shuffle 처음부터 재시작 (멱등성 보장)
+       - 재시도 로직으로 전송 성공
+
+    4. Merge → 완료
+
+Result:
+  ✅ Sorting 재수행 불필요 (시간 대폭 절약)
+  ✅ Shuffle만 재시도
+  ✅ 데이터 무결성 보장
 ```
 
-### 1.5 개선 가능성 (향후)
+```
+시나리오 3: Worker crashes just before Checkpoint save
+──────────────────────────────────────────────────────
+Before crash:
+  - Worker 2 completes Sorting
+  - savePhaseCheckpoint(PHASE_SORTING, 1.0) 호출 중
+  - Checkpoint 저장 50% → Crash
 
-**Milestone 4-5에서 선택적 구현**:
+Recovery:
+  Worker 2 restarts:
+    1. recoverFromCheckpoint()
+       - Latest checkpoint: PHASE_SAMPLING (이전 완료)
+       - PHASE_SORTING checkpoint는 불완전 (검증 실패)
+
+    2. Phase별 체크:
+       if (currentPhase == PHASE_SAMPLING) {
+         getPartitionConfiguration()  // Skip
+         performLocalSort()  // ⭐ Sorting 재수행
+       }
+
+Result:
+  ✅ 불완전한 checkpoint는 무시
+  ✅ 가장 최근의 완전한 checkpoint부터 재개
+  ✅ Worst case: Sorting 재수행 (여전히 Sampling은 스킵)
+```
+
+### 1.5 실제 구현 상세
+
+#### CheckpointManager 구현
 
 ```scala
-// Option A: Shuffle Output Replication (간단)
-class ShuffleManager {
-  def sendPartitionWithBackup(partition: File): Unit = {
-    val primary = getPrimaryWorker(partitionId)
-    val backup = getBackupWorker(partitionId)
+package distsort.checkpoint
 
-    // Send to both
-    Future.sequence(Seq(
-      sendTo(primary, partition),
-      sendTo(backup, partition)
-    ))
+case class Checkpoint(
+  id: String,
+  workerId: String,
+  phase: String,                   // WorkerPhase를 String으로 직렬화
+  timestamp: Instant,
+  progress: Double,
+  state: WorkerState
+)
+
+case class WorkerState(
+  processedRecords: Long,
+  partitionBoundaries: List[Array[Byte]],
+  shuffleMap: Map[Int, Int],
+  completedPartitions: Set[Int],
+  currentFiles: List[String],
+  phaseMetadata: Map[String, String]
+)
+
+class CheckpointManager(workerId: String, checkpointDir: String) {
+  private val gson = new GsonBuilder().setPrettyPrinting().create()
+  private val checkpointPath = Paths.get(checkpointDir, workerId)
+
+  /**
+   * Save checkpoint to disk (JSON format)
+   */
+  def saveCheckpoint(
+    phase: WorkerPhase,
+    state: WorkerState,
+    progress: Double
+  ): Future[String] = Future {
+    val checkpointId = s"checkpoint_${System.currentTimeMillis()}_${phase.toString}"
+    val checkpoint = Checkpoint(checkpointId, workerId, phase.toString,
+                                 Instant.now(), progress, state)
+
+    val file = checkpointPath.resolve(s"$checkpointId.json").toFile
+    val writer = new PrintWriter(file)
+
+    try {
+      writer.write(gson.toJson(checkpoint))
+      logger.info(s"Saved checkpoint $checkpointId (${(progress * 100).toInt}%)")
+      checkpointId
+    } finally {
+      writer.close()
+    }
+  }
+
+  /**
+   * Load latest valid checkpoint
+   */
+  def loadLatestCheckpoint(): Option[Checkpoint] = {
+    val checkpointFiles = checkpointPath.toFile.listFiles()
+      .filter(_.getName.endsWith(".json"))
+      .sortBy(_.lastModified()).reverse
+
+    checkpointFiles.headOption.flatMap { file =>
+      val json = Files.readString(file.toPath)
+      val checkpoint = gson.fromJson(json, classOf[Checkpoint])
+
+      if (validateCheckpoint(checkpoint.id)) {
+        Some(checkpoint)
+      } else {
+        None  // 불완전한 checkpoint 무시
+      }
+    }
+  }
+
+  /**
+   * Clean old checkpoints (keep last 3)
+   */
+  def cleanOldCheckpoints(keepLast: Int = 3): Unit = {
+    val checkpointFiles = checkpointPath.toFile.listFiles()
+      .filter(_.getName.endsWith(".json"))
+      .sortBy(_.lastModified()).reverse
+
+    checkpointFiles.drop(keepLast).foreach(_.delete())
   }
 }
-
-// Primary 실패 시 backup에서 복구 가능
 ```
 
+#### Worker에서의 Checkpoint 사용
+
 ```scala
-// Option B: Checkpoint-based Recovery (복잡)
-class MasterNode {
-  def checkpoint(): Unit = {
-    val state = CheckpointState(
-      phase = currentPhase,
-      workers = registeredWorkers,
-      partitionConfig = config,
-      completions = phaseTracker.getAll
+class Worker(...) extends ShutdownAware {
+  private val checkpointManager = CheckpointManager(workerId,
+                                                     s"/tmp/distsort/checkpoints")
+
+  def run(): Unit = {
+    // 1. Checkpoint에서 복구 시도
+    val recoveredFromCheckpoint = recoverFromCheckpoint()
+
+    if (!recoveredFromCheckpoint || currentPhase.get() == PHASE_INITIALIZING) {
+      performSampling()
+    }
+
+    // 복구된 Phase에 따라 적절한 단계부터 재개
+    if (currentPhase.get() == PHASE_SAMPLING || ...) {
+      getPartitionConfiguration()
+      savePhaseCheckpoint(PHASE_WAITING_FOR_PARTITIONS, 1.0)  // ⭐ 저장
+    }
+
+    if (currentPhase.get() == PHASE_SORTING || ...) {
+      performLocalSort()
+      savePhaseCheckpoint(PHASE_SORTING, 1.0)  // ⭐ 저장
+
+      performShuffle()
+      savePhaseCheckpoint(PHASE_SHUFFLING, 1.0)  // ⭐ 저장
+    }
+
+    performMerge()
+    savePhaseCheckpoint(PHASE_MERGING, 1.0)  // ⭐ 저장
+
+    // 성공 시 모든 checkpoint 삭제
+    checkpointManager.deleteAllCheckpoints()
+  }
+
+  private def recoverFromCheckpoint(): Boolean = {
+    checkpointManager.loadLatestCheckpoint() match {
+      case Some(checkpoint) =>
+        // 상태 복원
+        val (processedRecords, boundaries, shuffle, completed, files, metadata) =
+          WorkerState.toScala(checkpoint.state)
+
+        processedRecordCount.set(processedRecords)
+        partitionBoundaries = boundaries.toArray
+        shuffleMap = shuffle
+        completedPartitions.clear()
+        completed.foreach(p => completedPartitions.put(p, true))
+
+        // Phase 복원
+        val phase = WorkerPhase.fromName(checkpoint.phase)
+          .getOrElse(WorkerPhase.PHASE_INITIALIZING)
+
+        currentPhase.set(phase)
+        true  // 복구 성공
+
+      case None =>
+        false  // 처음부터 시작
+    }
+  }
+
+  private def savePhaseCheckpoint(phase: WorkerPhase, progress: Double): Unit = {
+    try {
+      val state = WorkerState.fromScala(
+        processedRecords = processedRecordCount.get(),
+        partitionBoundaries = partitionBoundaries.toSeq,
+        shuffleMap = shuffleMap,
+        completedPartitions = completedPartitions.keys().asScala.toSet,
+        currentFiles = fileLayout.getInputFiles.map(_.getAbsolutePath),
+        phaseMetadata = Map("workerId" -> workerId, "phase" -> phase.toString)
+      )
+
+      Await.result(checkpointManager.saveCheckpoint(phase, state, progress), 10.seconds)
+      checkpointManager.cleanOldCheckpoints(3)  // 최근 3개만 유지
+
+    } catch {
+      case ex: Exception =>
+        logger.warn(s"Checkpoint save failed: ${ex.getMessage}")
+        // Best-effort: 실패해도 계속 진행
+    }
+  }
+}
+```
+
+#### Graceful Shutdown 통합
+
+```scala
+class Worker(...) extends ShutdownAware {
+  private val shutdownManager = GracefulShutdownManager(
+    ShutdownConfig(
+      gracePeriod = 30.seconds,
+      saveCheckpoint = true,         // ⭐ Shutdown 시 checkpoint 저장
+      waitForCurrentPhase = true     // ⭐ 현재 Phase 완료 대기
     )
-    saveToFile(state)
-  }
+  )
 
-  def recover(): Unit = {
-    val state = loadCheckpoint()
-    // Resume from last completed phase
-    resumeFromPhase(state.phase)
+  override def gracefulShutdown(): Future[Unit] = {
+    logger.info("Initiating graceful shutdown...")
+
+    // 1. 현재 Phase 완료 대기
+    // 2. Checkpoint 저장
+    val currentState = getCurrentState()
+    checkpointManager.saveCheckpoint(currentPhase.get(), currentState, 0.5)
+
+    // 3. 리소스 정리
+    cleanupResources()
   }
 }
 ```
 
-**결정**: Milestone 1-3에서는 "전체 재시작", Milestone 4-5에서 선택적 개선
+#### 향후 개선 가능성
+
+**Phase 중간 지점 Checkpoint** (현재는 Phase 완료 시점만):
+- Sorting 중 chunk별 checkpoint
+- Shuffle 중 파티션별 checkpoint
+- 더 세밀한 복구 가능 (trade-off: overhead 증가)
+
+**Master Checkpoint** (현재는 Worker만):
+- Master 상태도 checkpoint
+- Master crash 시 복구 가능
+- 완전한 Fault Tolerance (현재는 Worker만)
 
 ---
 

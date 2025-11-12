@@ -331,24 +331,32 @@ Phase 4: Merge
 
 ## 4. 핵심 설계 결정 사항
 
-### 4.1 Fault Tolerance: Worker Re-registration
+### 4.1 Fault Tolerance: Checkpoint-based Recovery
 
 **PDF 요구사항**:
 > "The system must be fault-tolerant, which means that if a worker crashes and restarts, the overall computation should still produce correct results."
 
-#### 선택한 전략: Graceful Degradation with Job Restart
+#### 실제 구현 전략: Checkpoint-based Recovery
 
 ```
 ┌─────────────────────────────────────────────────┐
-│ Fault Tolerance Strategy                        │
+│ Fault Tolerance Strategy (실제 구현)            │
 ├─────────────────────────────────────────────────┤
-│ Phase 1-2 (Sampling/Sorting):                  │
-│   ✅ Continue with N-1 workers if >50% alive   │
-│   ✅ Recompute boundaries with remaining        │
+│ Checkpoint 저장:                                │
+│   ✅ 각 Phase 완료 시 자동 저장                  │
+│   ✅ WorkerState를 JSON으로 영속화               │
+│   ✅ 위치: /tmp/distsort/checkpoints/           │
+│   ✅ 최근 3개 checkpoint 유지                    │
 │                                                 │
-│ Phase 3-4 (Shuffle/Merge):                     │
-│   ❌ Cannot continue - restart entire job       │
-│   ✅ Worker restarts and re-registers           │
+│ Worker Crash & Restart:                         │
+│   ✅ 시작 시 최신 checkpoint 로드                │
+│   ✅ 마지막 완료 Phase부터 재개                  │
+│   ✅ Sampling/Sort 재수행 불필요                 │
+│                                                 │
+│ Graceful Shutdown:                              │
+│   ✅ 30초 grace period                          │
+│   ✅ 현재 Phase 완료 대기                        │
+│   ✅ Checkpoint 저장 후 종료                     │
 │                                                 │
 │ Data Integrity:                                 │
 │   ✅ Atomic writes (temp + rename)              │
@@ -357,14 +365,67 @@ Phase 4: Merge
 └─────────────────────────────────────────────────┘
 ```
 
+#### CheckpointManager 구현
+
+**저장되는 상태 (WorkerState)**:
+```scala
+case class WorkerState(
+  processedRecords: Long,              // 처리한 레코드 수
+  partitionBoundaries: List[Array[Byte]],  // 파티션 경계
+  shuffleMap: Map[Int, Int],           // 파티션 → Worker 매핑
+  completedPartitions: Set[Int],       // 완료한 파티션들
+  currentFiles: List[String],          // 현재 파일들
+  phaseMetadata: Map[String, String]   // Phase 메타데이터
+)
+```
+
+**Checkpoint 저장 시점**:
+```scala
+performSampling()
+  → savePhaseCheckpoint(PHASE_SAMPLING, 1.0)       // ✅
+
+getPartitionConfiguration()
+  → savePhaseCheckpoint(PHASE_WAITING_FOR_PARTITIONS, 1.0)  // ✅
+
+performLocalSort()
+  → savePhaseCheckpoint(PHASE_SORTING, 1.0)        // ✅
+
+performShuffle()
+  → savePhaseCheckpoint(PHASE_SHUFFLING, 1.0)      // ✅
+
+performMerge()
+  → savePhaseCheckpoint(PHASE_MERGING, 1.0)        // ✅
+  → checkpointManager.deleteAllCheckpoints()       // 성공 시 삭제
+```
+
+#### 복구 시나리오 예시
+
+```
+Worker crash during Shuffle:
+  Last checkpoint: PHASE_SORTING (100% 완료)
+
+Worker restart:
+  1. recoverFromCheckpoint() 성공
+  2. currentPhase = PHASE_SORTING (복원)
+  3. performShuffle() 재시작
+     ⭐ Sampling/Sort는 스킵 (시간 대폭 절약)
+  4. Merge → 완료
+
+Result:
+  ✅ 마지막 완료 Phase부터 재개
+  ✅ 빠른 복구 (전체 재시작 대비)
+  ✅ 정확성 보장
+```
+
 #### 정당화 (Justification)
 
 | 근거 | 설명 |
 |------|------|
-| **구현 복잡도** | Partial recovery는 Lineage tracking + Checkpoint 필요 → 프로젝트 범위 초과 |
-| **정확성 우선** | 부분 복구는 corner case가 많음 → 전체 재시작이 더 안전 |
-| **실제 시스템** | Hadoop 초기 버전도 JobTracker SPOF, 많은 batch processing 시스템이 job-level restart 사용 |
-| **PDF 해석** | "produce correct results" ← 성능보다 정확성 강조 |
+| **빠른 복구** | 마지막 완료 Phase부터 재개 → 전체 재시작보다 효율적 |
+| **정확성 보장** | Phase별 완료 checkpoint → 부분 결과 유실 없음 |
+| **실제 시스템** | Spark (RDD lineage + checkpoint), Flink (checkpoint 기반 exactly-once), MapReduce (Task-level restart) |
+| **구현 가능성** | CheckpointManager + JSON 직렬화 + Graceful Shutdown 통합 |
+| **PDF 해석** | "produce correct results" ← Checkpoint가 정확성과 효율성 모두 충족 |
 
 ### 4.2 N→M Partition Strategy
 
@@ -1445,13 +1506,18 @@ $ ./test_fault_tolerance.sh
 - 리팩토링 시 안전성 보장
 - 예: Record 클래스의 unsigned 비교 버그를 테스트로 먼저 발견
 
-#### Q2: "Fault Tolerance 전략이 전체 재시작인 이유는?"
+#### Q2: "Checkpoint 기반 복구는 어떻게 동작하나?"
 
 **답변**:
-- Partial recovery는 Lineage tracking + Checkpoint 필요 → 프로젝트 범위 초과
-- 정확성 우선: 부분 복구는 corner case가 많아 전체 재시작이 더 안전
-- PDF 요구사항: "produce correct results" ← 성능보다 정확성 강조
-- 향후 개선: Shuffle Output Replication 고려 가능
+- **저장**: 각 Phase 완료 시 WorkerState를 JSON으로 자동 저장 (`/tmp/distsort/checkpoints/`)
+- **복구**: Worker 재시작 시 최신 checkpoint 로드 → 마지막 완료 Phase부터 재개
+- **예시**: Shuffle 중 crash → PHASE_SORTING checkpoint 로드 → Shuffle만 재시도 (Sampling/Sort 스킵)
+- **장점**:
+  - 빠른 복구 (전체 재시작 대비 시간 절약)
+  - 정확성 보장 (Phase별 완료 시점 checkpoint)
+  - Graceful Shutdown 통합 (30초 grace period)
+- **구현**: CheckpointManager + JSON 직렬화 + 최근 3개 유지
+- **PDF 요구사항**: "produce correct results" ← 정확성과 효율성 모두 충족
 
 #### Q3: "N→M 전략의 장점은?"
 
