@@ -57,8 +57,8 @@
 * Week 1: [Here](./meet_log/week1/week1_document.md)
 * Week 2: [Here](./meet_log/week2/week2_document.md)
 * Week 3: [Here](./meet_log/week3/week3_document.md)
-* Week 4: To be updated
-* Week 5: To be updated
+* Week 4: [Here](./meet_log/week4/week4_document.md)
+* Week 5: [Here](./meet_log/week5/week5_document.md)
 * Week 6: To be updated
 * Week 7: To be updated
 * Week 8: To be updated

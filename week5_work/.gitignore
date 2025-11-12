@@ -1,0 +1,16 @@
+# SBT
+target/
+project/target/
+project/project/target/
+
+# Scala
+*.class
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Mac
+.DS_Store
