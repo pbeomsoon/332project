@@ -63,22 +63,7 @@
 | 입력 디렉토리 보호 | ✅ 완료 | FileLayout validation |
 | 임시 파일 정리 | ✅ 완료 | cleanup 로직 구현 |
 
-### 2.2 TDD 기반 개발 정착
 
-```
-Record (Week 4):         5/5 tests passing
-RecordReader (Week 5):   15/15 tests passing (예정)
-FileLayout (Week 5):     10/10 tests passing (예정)
-
-총 테스트 커버리지: 95%+ (core components)
-```
-
-### 2.3 코드 품질
-
-- ✅ Scala 표준 스타일 가이드 준수
-- ✅ 모든 public method에 Scaladoc 작성
-- ✅ Error handling (Option, Either)
-- ✅ Immutable data structures 우선 사용
 
 ---
 
@@ -275,18 +260,4 @@ valsort test_output.dat
 - `report/progress_presentation.md`
 - `meet_log/week5/week5_document.md`
 
-**업데이트된 문서:**
-- `plan/implementation_guide.md` (Week 5 진행 반영)
-
-### 8.2 Git Repository
-
-**Commit 전략:**
-- Week 5 컴포넌트를 `git_project_forder/week5_work/`로 복사
-- main/ 폴더는 변경 없음 (비공개)
-- 점진적 공개 전략 유지
-
 ---
-
-**Week 5 진행률**: 100% 완료
-**다음 주 목표**: Algorithms 구현 (ExternalSorter, Partitioner, KWayMerger)
-**전체 진행률**: 40% (Week 4-5 완료, Week 6-9 예정)

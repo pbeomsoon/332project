@@ -112,25 +112,38 @@ Merge (merging 500 files) using K-way merge
 
 **문제**:
 - Worker가 실행 중 crash (killed by OS)
-- 모든 중간 데이터 손실
+- **모든 중간 데이터 손실** ("All its intermediate data is lost")
 - 같은 노드에서 새 Worker 시작 (같은 파라미터)
 
-**요구사항**: **Fault-tolerant**
-- 새 Worker가 기존 Worker와 동일한 출력 생성
+**요구사항**: **Fault-tolerant system**
+- 새 Worker가 기존 Worker와 **동일한 출력 생성** (deterministic)
 - 전체 시스템이 정확한 결과 생성
 
-**해결책**: **Checkpoint-based Recovery**
+**해결책**: **2-Layer Fault Tolerance (Checkpoint + Replication)**
 
 ```
-Worker crash during Shuffle:
+Worker 2 crash during Shuffle:
   Last checkpoint: PHASE_SORTING (100% 완료)
+  Lost data: P6, P7, P8 (intermediate partition files)
 
-Worker restart:
-  1. Load checkpoint
-  2. Restore state (partitionBoundaries, shuffleMap, ...)
-  3. Resume from PHASE_SORTING
+Worker 2' restart:
+  1. Load checkpoint (Layer 1)
+     → Restore state (shuffleMap, partitionBoundaries, ...)
+     → Resume point: PHASE_SORTING
+
+  2. Recover lost data from replicas (Layer 2)
+     → Fetch P6 from Worker 1 (backup copy)
+     → Fetch P7 from Worker 0 (backup copy)
+     → Fetch P8 from Worker 3 (backup copy)
+     → Checksum verification ✅
+
+  3. Resume from last completed phase
+     → Shuffle → Merge → Complete
      ⭐ Sampling/Sort 스킵 (빠른 복구)
-  4. Continue: Shuffle → Merge → Complete
+
+Result:
+  ✅ Fault-tolerant system (슬라이드 요구사항 충족)
+  ✅ 동일한 최종 출력 (deterministic recovery)
 ```
 
 ### Additional Requirements
@@ -226,6 +239,149 @@ Phase 5: Completion
   ├─ Master가 정렬된 Worker 주소 출력 (stdout)
   └─ 임시 파일 정리
 ```
+
+---
+
+#### 📊 Phase 1 Sampling 상세 설명
+
+**핵심 질문**: "Master가 전체 샘플 정렬"은 무슨 의미인가?
+
+**목적**: 전체 데이터의 key 분포를 파악하고 **균등한 크기의 파티션**을 만들기 위해
+
+**구체적인 예시 (4 Workers, 12 Partitions)**:
+
+**Step 1: 각 Worker가 샘플 추출**
+```scala
+class Sampler(sampleRate: Double = 0.1) {  // 10% 샘플링
+  def extractSamples(file: File): Seq[Record] = {
+    // Random sampling
+    if (random.nextDouble() < sampleRate) {
+      samples += record
+    }
+  }
+}
+```
+
+```
+Worker 0 샘플: [0x15, 0x89, 0x23, 0xAA, 0x12, ...] (100개 keys)
+Worker 1 샘플: [0x67, 0x12, 0xAB, 0x45, 0xF3, ...] (100개 keys)
+Worker 2 샘플: [0x34, 0x78, 0xCC, 0x9A, 0x01, ...] (100개 keys)
+Worker 3 샘플: [0x99, 0x3F, 0xDD, 0x6B, 0x28, ...] (100개 keys)
+```
+
+**Step 2: Master가 모든 샘플을 모음**
+```
+allSamples (400개 keys):
+  [0x15, 0x89, ..., 0x67, 0x12, ..., 0x34, 0x78, ..., 0x99, 0x3F, ...]
+```
+
+**Step 3: ⭐ Master가 샘플을 정렬 (Unsigned byte 비교)**
+```scala
+// MasterService.scala의 computePartitionBoundaries()
+val sortedSamples = allSamples.sorted(byteArrayOrdering)
+
+implicit val byteArrayOrdering: Ordering[Array[Byte]] = new Ordering[Array[Byte]] {
+  override def compare(x: Array[Byte], y: Array[Byte]): Int = {
+    var i = 0
+    while (i < x.length && i < y.length) {
+      val cmp = java.lang.Integer.compareUnsigned(x(i) & 0xFF, y(i) & 0xFF)
+      if (cmp != 0) return cmp
+      i += 1
+    }
+    x.length - y.length
+  }
+}
+```
+
+```
+sortedSamples (400개 keys, 오름차순):
+  [0x01, 0x12, 0x12, 0x15, 0x23, 0x28, 0x34, 0x3F, 0x45, ..., 0xF3, 0xFF]
+  ↑                                                                      ↑
+  가장 작은 key                                                  가장 큰 key
+```
+
+**Step 4: 균등한 간격으로 파티션 경계 선택**
+```scala
+val step = sortedSamples.length / numPartitions  // 400 / 12 = 33
+partitionBoundaries = (1 until numPartitions).map { i =>
+  sortedSamples(i * step)  // 33번째, 66번째, 99번째, ...
+}
+```
+
+```
+Partition Boundaries (11개 경계, 12개 파티션 생성):
+
+partitionBoundaries[0]  = sortedSamples[33]  → 0x2F
+partitionBoundaries[1]  = sortedSamples[66]  → 0x5A
+partitionBoundaries[2]  = sortedSamples[99]  → 0x78
+partitionBoundaries[3]  = sortedSamples[132] → 0x95
+...
+partitionBoundaries[10] = sortedSamples[363] → 0xE8
+
+결과적으로 생성되는 파티션:
+  Partition 0:  [0x00, 0x2F) ← 가장 작은 key들
+  Partition 1:  [0x2F, 0x5A)
+  Partition 2:  [0x5A, 0x78)
+  Partition 3:  [0x78, 0x95)
+  ...
+  Partition 11: [0xE8, 0xFF] ← 가장 큰 key들
+```
+
+**Step 5: shuffleMap 생성 (N→M 전략)**
+```scala
+def createShuffleMap(numWorkers: Int, numPartitions: Int): Map[Int, Int] = {
+  val partitionsPerWorker = numPartitions / numWorkers  // 12 / 4 = 3
+
+  (0 until numPartitions).map { partitionID =>
+    val workerID = partitionID / partitionsPerWorker
+    partitionID -> workerID
+  }.toMap
+}
+
+// 결과:
+shuffleMap = {
+  0→0, 1→0, 2→0,     // P0, P1, P2 → Worker 0
+  3→1, 4→1, 5→1,     // P3, P4, P5 → Worker 1
+  6→2, 7→2, 8→2,     // P6, P7, P8 → Worker 2
+  9→3, 10→3, 11→3    // P9, P10, P11 → Worker 3
+}
+```
+
+**시각화**:
+```
+전체 데이터 분포 (50GB):
+┌────────────────────────────────────────────────┐
+│ 0x00 ──────────────────────────────── 0xFF    │
+└────────────────────────────────────────────────┘
+         ↓ 샘플링 (10%)
+┌────────────────────────────────────────────────┐
+│ 샘플: 400개 keys                               │
+└────────────────────────────────────────────────┘
+         ↓ 정렬
+┌────────────────────────────────────────────────┐
+│ sortedSamples: [0x01, 0x12, ..., 0xFF]        │
+└────────────────────────────────────────────────┘
+         ↓ 균등 분할 (step = 33)
+┌────┬────┬────┬────┬────┬────┬────┬────┬────┐
+│ P0 │ P1 │ P2 │ P3 │ P4 │ P5 │... │P10 │P11 │
+└────┴────┴────┴────┴────┴────┴────┴────┴────┘
+0x00 0x2F 0x5A 0x78 0x95 ...               0xFF
+
+각 파티션 예상 크기: 50GB / 12 ≈ 4.17GB
+```
+
+**왜 샘플을 사용하는가?**
+1. **메모리 제한**: 50GB 전체를 Master 메모리에 올릴 수 없음
+2. **시간 절약**: 400개 샘플 정렬 vs 500,000,000개 레코드 정렬
+3. **충분히 정확**: 샘플이 전체 데이터 분포를 잘 대표함
+
+**장점**:
+- ✅ 각 파티션의 **예상 크기가 비슷함** (로드 밸런싱)
+- ✅ Worker별 부하가 균등함 (각 Worker가 3개 파티션 처리)
+- ✅ 최종 출력이 정렬됨 (P0 → P1 → ... → P11 순서로 전역 정렬)
+- ✅ 전체 데이터를 정렬하지 않고도 분포 파악 가능
+
+---
 
 ### 3.3 Challenge 1 해결: External Sort (메모리 제한)
 
@@ -356,13 +512,21 @@ def createShuffleMap(numWorkers: Int, numPartitions: Int): Map[Int, Int] = {
 - ✅ 멀티코어 활용 증가 (병렬 merge)
 - ✅ 파티션 크기 불균형 완화
 
-### 3.5 Challenge 3 해결: Checkpoint-based Recovery
+### 3.5 Challenge 3 해결: 2-Layer Fault Tolerance
 
-**문제**: Worker가 실행 중 crash → 모든 중간 데이터 손실
+**문제**: Worker가 실행 중 crash → **모든 중간 데이터 손실**
 
-**해결책**: Phase별 Checkpoint + Graceful Shutdown
+**해결책**: 2-Layer Fault Tolerance
+- **Layer 1**: Checkpoint (진행 상태 복구)
+- **Layer 2**: Replication (중간 데이터 복구)
 
-#### Checkpoint 저장
+---
+
+#### Layer 1: Checkpoint (진행 상태 복구)
+
+**목적**: Worker가 어디까지 진행했는지 추적
+
+**Checkpoint 저장**
 
 ```scala
 case class WorkerState(
@@ -483,7 +647,7 @@ Result:
   ✅ 정확성 보장
 ```
 
-#### Graceful Shutdown
+**Graceful Shutdown 통합**:
 
 ```scala
 class Worker(...) extends ShutdownAware {
@@ -507,11 +671,202 @@ class Worker(...) extends ShutdownAware {
 }
 ```
 
-**장점**:
+---
+
+#### Layer 2: Replication (중간 데이터 복구)
+
+**목적**: Worker crash 시 손실된 중간 파일을 다른 Worker에서 복구
+
+**Replication 설정**:
+
+```scala
+case class ReplicationMetadata(
+  partitionId: Int,
+  primaryWorker: Int,
+  backupWorkers: Seq[Int],    // ⭐ 복제본 위치
+  version: Long,
+  checksum: String,            // ⭐ 데이터 무결성 검증
+  size: Long
+)
+
+case class PartitionData(
+  id: Int,
+  records: Seq[Record],
+  checksum: String,
+  metadata: Map[String, String] = Map.empty
+)
+
+class ReplicationManager(
+  replicationFactor: Int = 2,  // ⭐ 기본값: 원본 + 복제본 1개
+  workerClients: Map[Int, WorkerClient]
+) {
+
+  /**
+   * 파티션을 백업 Worker들에 복제
+   */
+  def replicatePartition(
+    partitionData: PartitionData,
+    replicas: Seq[Int],
+    primaryWorker: Int
+  ): Future[Unit] = {
+    val version = replicationVersion.incrementAndGet()
+
+    val metadata = ReplicationMetadata(
+      partitionId = partitionData.id,
+      primaryWorker = primaryWorker,
+      backupWorkers = replicas,
+      version = version,
+      checksum = partitionData.checksum,
+      size = partitionData.records.size
+    )
+
+    // 병렬로 replicas에 전송
+    val replicationFutures = replicas.map { workerId =>
+      sendToReplica(partitionData, workerId).map { success =>
+        if (success) {
+          logger.info(s"Replicated partition ${partitionData.id} to Worker $workerId")
+        }
+      }
+    }
+
+    Future.sequence(replicationFutures).map(_ => ())
+  }
+
+  /**
+   * Replica에서 파티션 복구
+   */
+  def recoverFromReplica(
+    partitionId: Int,
+    failedWorker: Int
+  ): Future[PartitionData] = {
+    replicationMetadata.get(partitionId) match {
+      case Some(metadata) if metadata.primaryWorker == failedWorker =>
+        // 백업 Worker 중 첫 번째에서 복구
+        val backupWorker = metadata.backupWorkers.head
+
+        workerClients(backupWorker)
+          .fetchPartition(partitionId)
+          .map { data =>
+            // ⭐ Checksum 검증
+            if (data.checksum == metadata.checksum) {
+              logger.info(s"Successfully recovered partition $partitionId from Worker $backupWorker")
+              data
+            } else {
+              throw new Exception("Checksum mismatch")
+            }
+          }
+
+      case _ =>
+        Future.failed(new Exception(s"No replica found for partition $partitionId"))
+    }
+  }
+
+  /**
+   * Replica Worker 선택 (Consistent Hashing)
+   */
+  def selectReplicas(
+    partitionId: Int,
+    excludeWorker: Int
+  ): Seq[Int] = {
+    val availableWorkers = workerClients.keys.filterNot(_ == excludeWorker).toSeq
+
+    if (availableWorkers.size < replicationFactor - 1) {
+      logger.warn(s"Not enough workers for replication factor $replicationFactor")
+      availableWorkers
+    } else {
+      // Deterministic selection
+      val random = new Random(partitionId)
+      random.shuffle(availableWorkers).take(replicationFactor - 1)
+    }
+  }
+}
+```
+
+**Replication 시점**:
+```
+Phase 2: Sort & Partition 완료 후
+  ├─ Worker 0이 P0, P1, P2 생성
+  ├─ ReplicationManager.replicatePartition(P0, Seq(Worker1), Worker0)
+  ├─ ReplicationManager.replicatePartition(P1, Seq(Worker2), Worker0)
+  └─ ReplicationManager.replicatePartition(P2, Seq(Worker3), Worker0)
+
+Result:
+  Worker 0: P0 (primary), P3 (backup), P6 (backup), P9 (backup)
+  Worker 1: P0 (backup), P3 (primary), P7 (backup), P10 (backup)
+  ...
+```
+
+---
+
+#### 통합 복구 시나리오
+
+**Scenario: Worker 2 crashes during Phase 3 (Shuffle)**
+
+```
+Initial State:
+  Worker 0, 1, 2, 3 → Phase 2 완료, 각각 P0~P11 생성
+  Worker 2가 Shuffle 중 crash
+
+Crash Detection:
+  Master가 Worker 2의 heartbeat timeout 감지
+  → Worker 2' (새 프로세스) 시작
+
+Recovery Process:
+
+  Step 1: Checkpoint 로드 (Layer 1)
+    Worker 2'.recoverFromCheckpoint()
+    → currentPhase = PHASE_SORTING (마지막 완료 Phase)
+    → shuffleMap, partitionBoundaries 복구
+    → completedPartitions = {6, 7, 8} 복구
+
+  Step 2: 중간 파일 복구 (Layer 2)
+    Worker 2'가 손실된 파티션 확인:
+      P6, P7, P8 (Worker 2가 Sort에서 생성했던 파일들)
+
+    ReplicationManager.recoverFromReplica(6, 2)
+      → Worker 1의 backup에서 P6 복사
+      → Checksum 검증 ✅
+
+    ReplicationManager.recoverFromReplica(7, 2)
+      → Worker 0의 backup에서 P7 복사
+      → Checksum 검증 ✅
+
+    ReplicationManager.recoverFromReplica(8, 2)
+      → Worker 3의 backup에서 P8 복사
+      → Checksum 검증 ✅
+
+  Step 3: 마지막 Phase부터 재개
+    Worker 2'.performShuffle()  // ⭐ Sorting 스킵, Shuffle부터 시작
+    Worker 2'.performMerge()
+    Worker 2'.reportCompletion()
+
+Result:
+  ✅ 빠른 복구 (Sampling/Sorting 스킵)
+  ✅ 데이터 손실 없음 (Replica에서 복구)
+  ✅ 정확성 보장 (Checksum 검증)
+  ✅ 최종 출력 동일 (deterministic)
+```
+
+---
+
+#### 2-Layer Fault Tolerance 장점
+
+**Checkpoint (Layer 1)**:
 - ✅ 빠른 복구 (마지막 완료 Phase부터 재개)
-- ✅ 정확성 보장 (Phase별 완료 checkpoint)
-- ✅ Graceful Shutdown (안전한 종료)
-- ✅ 간단한 구현 (JSON 직렬화 + 최근 3개 유지)
+- ✅ 가벼운 오버헤드 (JSON 직렬화)
+- ✅ Process memory 복구
+- ✅ Graceful Shutdown 통합
+
+**Replication (Layer 2)**:
+- ✅ 디스크 손실 대응 (중간 파일 복구)
+- ✅ Checksum 검증 (데이터 무결성)
+- ✅ Consistent Hashing (deterministic replica 선택)
+- ✅ Configurable replication factor (1~N)
+
+**Combined**:
+- ✅ **"All intermediate data is lost" 문제 완전 해결**
+- ✅ 슬라이드 요구사항 충족: "fault-tolerant system"
+- ✅ 새 Worker가 동일한 출력 생성 (deterministic)
 
 ### 3.6 Additional Requirements 해결
 
@@ -638,7 +993,25 @@ class Worker(
 
 ### 3.7 gRPC 기반 통신
 
+#### 왜 gRPC를 선택했는가?
+
+| 비교 항목 | HTTP/REST | **gRPC** (선택) |
+|----------|-----------|----------------|
+| 성능 | JSON 텍스트 (느림) | Protocol Buffers 바이너리 (빠름) |
+| Streaming | 제한적 (WebSocket 필요) | ✅ 양방향 streaming 네이티브 지원 |
+| 타입 안정성 | 없음 (런타임 에러) | ✅ 컴파일 타임 타입 체크 |
+| Code generation | 수동 작성 | ✅ .proto → Scala stub 자동 생성 |
+| 대용량 전송 | Chunking 수동 구현 | ✅ Streaming으로 자연스럽게 처리 |
+
+**결론**: 분산 정렬에서 **대용량 파티션 전송**과 **양방향 통신**이 필수 → gRPC가 최적
+
+---
+
+#### Protocol Buffers 정의
+
 ```protobuf
+// distsort.proto
+
 service MasterService {
   rpc RegisterWorker(WorkerInfo) returns (RegistrationResponse);
   rpc SendSample(SampleData) returns (Ack);
@@ -648,7 +1021,7 @@ service MasterService {
 
 service WorkerService {
   rpc SetPartitionBoundaries(PartitionConfig) returns (Ack);
-  rpc ShuffleData(stream ShuffleDataChunk) returns (ShuffleAck);
+  rpc ShuffleData(stream ShuffleDataChunk) returns (ShuffleAck);  // ⭐ Streaming
   rpc StartShuffle(ShuffleSignal) returns (Ack);
   rpc StartMerge(MergeSignal) returns (Ack);
   rpc GetStatus(StatusRequest) returns (WorkerStatus);
@@ -658,11 +1031,145 @@ message PartitionConfig {
   repeated bytes boundaries = 1;       // N-1 or M-1 개의 경계
   int32 num_partitions = 2;            // N or M
   map<int32, int32> shuffle_map = 3;   // partitionID → workerID
-  repeated WorkerInfo all_workers = 4;
+  repeated WorkerInfo all_workers = 4; // 전체 Worker 정보
+}
+
+message ShuffleDataChunk {
+  int32 partition_id = 1;
+  int32 source_worker = 2;
+  bytes data = 3;                      // ⭐ 1MB chunk
+  int64 sequence_number = 4;
+  bool is_last_chunk = 5;
 }
 ```
 
-**Shuffle 재시도 로직**:
+---
+
+#### 각 RPC 메서드의 역할과 호출 시점
+
+**MasterService (Worker → Master 호출)**
+
+| RPC 메서드 | 호출 시점 | 역할 | 응답 |
+|-----------|----------|------|------|
+| `RegisterWorker` | Phase 0: Worker 시작 직후 | Worker 등록, index 할당 | `workerIndex`, `numWorkers` |
+| `SendSample` | Phase 1: Sampling 완료 후 | 샘플 전송 (100~10,000개 keys) | `Ack` |
+| `NotifyPhaseComplete` | 각 Phase 완료 시 | Phase 완료 보고 | `proceedToNext`, `nextPhase` |
+| `Heartbeat` | 매 10초 (백그라운드) | Worker 생존 확인 | `timestamp` |
+
+**WorkerService (Worker ↔ Worker 호출, Master → Worker 호출)**
+
+| RPC 메서드 | 호출자 | 호출 시점 | 역할 |
+|-----------|-------|----------|------|
+| `SetPartitionBoundaries` | Master | Phase 1 완료 후 | 파티션 경계 브로드캐스트 |
+| `ShuffleData` | Worker | Phase 3: Shuffle | **⭐ 파티션 전송 (streaming)** |
+| `StartShuffle` | Master | Phase 3 시작 | Shuffle 명령 |
+| `StartMerge` | Master | Phase 4 시작 | Merge 명령 |
+| `GetStatus` | Master/User | 언제든지 | Worker 상태 조회 |
+
+---
+
+#### Streaming의 필요성: ShuffleData
+
+**문제**: Worker 0이 Worker 1에게 4GB 파티션을 전송해야 함
+
+**Non-streaming (잘못된 방식)**:
+```scala
+// ❌ 4GB를 한 번에 메모리에 로드 → OutOfMemoryError
+val allData = readFile(partitionFile)  // 4GB
+stub.shuffleData(ShuffleDataChunk(partitionId, allData))
+```
+
+**Streaming (올바른 방식)**:
+```scala
+// ✅ 1MB씩 chunk로 나눠서 전송
+val CHUNK_SIZE = 1 * 1024 * 1024  // 1MB
+
+def sendPartitionStreaming(partitionFile: File, partitionId: Int): Unit = {
+  val inputStream = new FileInputStream(partitionFile)
+  val buffer = new Array[Byte](CHUNK_SIZE)
+  var sequenceNumber = 0L
+  var bytesRead = 0
+
+  val requestObserver = stub.shuffleData(responseObserver)
+
+  while ({ bytesRead = inputStream.read(buffer); bytesRead > 0 }) {
+    val chunk = ShuffleDataChunk(
+      partitionId = partitionId,
+      sourceWorker = myWorkerId,
+      data = ByteString.copyFrom(buffer, 0, bytesRead),
+      sequenceNumber = sequenceNumber,
+      isLastChunk = false
+    )
+
+    requestObserver.onNext(chunk)  // ⭐ 비동기 전송
+    sequenceNumber += 1
+  }
+
+  // 마지막 chunk 표시
+  requestObserver.onNext(chunk.copy(isLastChunk = true))
+  requestObserver.onCompleted()
+}
+```
+
+**장점**:
+- ✅ 메모리 사용량: 4GB → 1MB (4000배 절약)
+- ✅ 파이프라이닝: 전송과 읽기 동시 진행
+- ✅ 조기 오류 감지: 첫 chunk 실패 시 즉시 중단
+
+---
+
+#### Shuffle 네트워크 통신 흐름도
+
+**시나리오**: 4 Workers, 12 Partitions (각 Worker가 3개씩 담당)
+
+```
+Phase 3: Shuffle (Worker-to-Worker 통신)
+
+Worker 0이 생성한 파티션들:
+┌─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┐
+│ P0  │ P1  │ P2  │ P3  │ P4  │ P5  │ P6  │ P7  │ P8  │ P9  │ P10 │ P11 │
+└──┬──┴──┬──┴──┬──┴─────┴─────┴─────┴─────┴─────┴─────┴─────┴─────┴─────┘
+   │     │     │
+   │     │     └─────────────────────────────────────┐
+   │     └──────────────────────────┐                │
+   │                                │                │
+   ↓ gRPC streaming                 ↓                ↓
+┌──────────┐                   ┌──────────┐    ┌──────────┐
+│ Worker 0 │                   │ Worker 1 │    │ Worker 2 │
+│ (keep)   │                   │ (recv)   │    │ (recv)   │
+└──────────┘                   └──────────┘    └──────────┘
+
+Worker 0 → Worker 0: P0 (자기 자신, 복사만)
+Worker 0 → Worker 0: P1 (자기 자신, 복사만)
+Worker 0 → Worker 0: P2 (자기 자신, 복사만)
+
+Worker 0 → Worker 1: P3 (gRPC streaming, 1MB chunks)
+Worker 0 → Worker 1: P4 (gRPC streaming, 1MB chunks)
+Worker 0 → Worker 1: P5 (gRPC streaming, 1MB chunks)
+
+Worker 0 → Worker 2: P6 (gRPC streaming, 1MB chunks)
+Worker 0 → Worker 2: P7 (gRPC streaming, 1MB chunks)
+Worker 0 → Worker 2: P8 (gRPC streaming, 1MB chunks)
+
+... (다른 Worker들도 동일)
+
+총 네트워크 전송:
+  - Worker 0 → Worker 1: 3개 파티션
+  - Worker 0 → Worker 2: 3개 파티션
+  - Worker 0 → Worker 3: 3개 파티션
+  (자기 자신 3개는 네트워크 전송 없음, 로컬 복사)
+
+전체: 4 workers × 9 network transfers = 36 transfers
+```
+
+---
+
+#### 재시도 로직과 지수 백오프
+
+**문제**: 네트워크는 불안정함 (일시적 장애, 혼잡, Worker 재시작 등)
+
+**해결**: Exponential Backoff + Retry
+
 ```scala
 def sendPartitionWithRetry(
     partitionFile: File,
@@ -675,19 +1182,138 @@ def sendPartitionWithRetry(
 
   while (attempt < maxRetries && !success) {
     try {
+      logger.info(s"Sending partition $partitionId to ${targetWorker.workerId} (attempt ${attempt + 1}/$maxRetries)")
+
       sendPartition(partitionFile, partitionId, targetWorker)
+
       success = true
+      logger.info(s"Successfully sent partition $partitionId")
+
     } catch {
       case e: StatusRuntimeException if isRetryable(e) =>
         attempt += 1
-        val backoffMs = math.pow(2, attempt).toLong * 1000  // 지수 백오프
-        Thread.sleep(backoffMs)
+
+        if (attempt < maxRetries) {
+          // ⭐ 지수 백오프: 1초 → 2초 → 4초
+          val backoffMs = math.pow(2, attempt).toLong * 1000
+          logger.warn(s"Retryable error for partition $partitionId: ${e.getMessage}. " +
+                      s"Retrying in ${backoffMs}ms (attempt $attempt/$maxRetries)")
+          Thread.sleep(backoffMs)
+        } else {
+          logger.error(s"Failed to send partition $partitionId after $maxRetries attempts")
+          throw e
+        }
+
       case e: Exception =>
+        // 재시도 불가능한 에러 (예: 잘못된 파티션 ID)
+        logger.error(s"Non-retryable error for partition $partitionId: ${e.getMessage}")
         throw e
     }
   }
 }
+
+def isRetryable(e: StatusRuntimeException): Boolean = {
+  e.getStatus.getCode match {
+    case Status.Code.UNAVAILABLE => true   // Worker 일시적으로 다운
+    case Status.Code.DEADLINE_EXCEEDED => true  // 타임아웃
+    case Status.Code.RESOURCE_EXHAUSTED => true  // 혼잡
+    case _ => false
+  }
+}
 ```
+
+**지수 백오프의 효과**:
+```
+Attempt 1: 즉시 시도 → 실패 (네트워크 혼잡)
+  ↓ 1초 대기
+Attempt 2: 재시도 → 실패 (여전히 혼잡)
+  ↓ 2초 대기
+Attempt 3: 재시도 → 성공 (혼잡 해소됨)
+
+총 시간: 3초 (실패로 끝나는 것보다 훨씬 나음)
+```
+
+**왜 지수적으로 증가하는가?**
+1. **혼잡 완화**: 모든 Worker가 동시에 재시도하면 더 혼잡해짐
+2. **일시적 장애 대응**: 짧은 장애는 1초, 긴 장애는 4초 대기
+3. **Thundering Herd 방지**: Worker들의 재시도 시간을 분산
+
+---
+
+#### Heartbeat의 역할
+
+**목적**: Master가 Worker의 생존 여부를 추적
+
+```scala
+// Worker: 백그라운드 스레드에서 10초마다 heartbeat 전송
+val heartbeatExecutor = Executors.newSingleThreadScheduledExecutor()
+
+heartbeatExecutor.scheduleAtFixedRate(
+  new Runnable {
+    def run(): Unit = {
+      try {
+        val request = HeartbeatRequest(workerId, currentPhase.toString)
+        masterStub.heartbeat(request)
+        logger.debug(s"Heartbeat sent: $workerId at phase $currentPhase")
+      } catch {
+        case e: Exception =>
+          logger.error(s"Failed to send heartbeat: ${e.getMessage}")
+      }
+    }
+  },
+  0,        // initial delay
+  10,       // period: 10초
+  TimeUnit.SECONDS
+)
+```
+
+```scala
+// Master: 30초 동안 heartbeat 없으면 Worker 제거
+val HEARTBEAT_TIMEOUT = 30 * 1000  // 30초
+
+def checkWorkerHealth(): Unit = {
+  val now = System.currentTimeMillis()
+
+  registeredWorkers.foreach { case (workerId, workerInfo) =>
+    val lastHeartbeat = workerInfo.lastHeartbeatTime
+
+    if (now - lastHeartbeat > HEARTBEAT_TIMEOUT) {
+      logger.warn(s"Worker $workerId timeout (no heartbeat for 30s)")
+
+      // Worker 제거 + 다른 Worker들에게 알림
+      registeredWorkers.remove(workerId)
+      notifyWorkerFailure(workerId)
+    }
+  }
+}
+```
+
+**Heartbeat를 통한 Worker 장애 감지**:
+```
+Worker 2 crashes at 10:00:00
+
+10:00:10 - Master receives last heartbeat from Worker 2
+10:00:20 - No heartbeat (10s elapsed)
+10:00:30 - No heartbeat (20s elapsed)
+10:00:40 - ⭐ TIMEOUT (30s elapsed)
+         → Master removes Worker 2
+         → Master triggers recovery:
+           - Checkpoint + Replication recovery
+           - 새 Worker 2' 시작
+```
+
+---
+
+#### gRPC 통신 장점 정리
+
+| 장점 | 설명 |
+|------|------|
+| ✅ **고성능** | Protocol Buffers (바이너리) + HTTP/2 multiplexing |
+| ✅ **Streaming** | 대용량 파티션 전송 (4GB → 1MB chunks) |
+| ✅ **타입 안전성** | Compile-time 타입 체크 (.proto → Scala stub) |
+| ✅ **재시도 로직** | StatusRuntimeException으로 네트워크 오류 분류 |
+| ✅ **양방향 통신** | Master ↔ Worker, Worker ↔ Worker 모두 지원 |
+| ✅ **Backpressure** | Streaming으로 자연스럽게 flow control |
 
 ---
 
@@ -858,7 +1484,7 @@ Week 4-5: Core I/O Components (100% 완료)
   ├─ FileLayout (파일 시스템 관리)
   └─ RecordWriter (Binary/ASCII 출력)
 
-Week 5: Algorithms (100% 완료) ⭐ 실제로는 완료됨
+Week 5: Algorithms (100% 완료) 
   ├─ ExternalSorter (2-Pass External Sort)
   ├─ Partitioner (Range-based partitioning)
   └─ KWayMerger (Priority Queue 기반 병합)
@@ -1041,26 +1667,78 @@ class CheckpointManager(workerId: String) {
 }
 ```
 
-**해결**: Challenge 3 (Fault Tolerance)
+**해결**: Challenge 3 - Layer 1 (진행 상태 복구)
 
-#### ✅ 8. Worker with Checkpoint Integration (Week 6)
+#### ✅ 8. ReplicationManager (Week 5)
+
+```scala
+class ReplicationManager(
+  replicationFactor: Int = 2,
+  workerClients: Map[Int, WorkerClient]
+) {
+  def replicatePartition(
+    partitionData: PartitionData,
+    replicas: Seq[Int],
+    primaryWorker: Int
+  ): Future[Unit] = {
+    // 병렬로 replicas에 전송
+    val replicationFutures = replicas.map { workerId =>
+      sendToReplica(partitionData, workerId)
+    }
+    Future.sequence(replicationFutures).map(_ => ())
+  }
+
+  def recoverFromReplica(
+    partitionId: Int,
+    failedWorker: Int
+  ): Future[PartitionData] = {
+    // Replica에서 데이터 복구 + Checksum 검증
+    workerClients(backupWorker)
+      .fetchPartition(partitionId)
+      .map { data =>
+        if (data.checksum == metadata.checksum) data
+        else throw new Exception("Checksum mismatch")
+      }
+  }
+
+  def selectReplicas(partitionId: Int, excludeWorker: Int): Seq[Int] = {
+    // Consistent hashing for deterministic replica selection
+    val random = new Random(partitionId)
+    random.shuffle(availableWorkers).take(replicationFactor - 1)
+  }
+}
+```
+
+**해결**: Challenge 3 - Layer 2 (중간 데이터 복구)
+
+#### ✅ 9. Worker with 2-Layer Fault Tolerance (Week 6)
 
 ```scala
 class Worker(...) extends ShutdownAware {
   private val checkpointManager = CheckpointManager(workerId)
+  private val replicationManager = ReplicationManager(replicationFactor = 2, workerClients)
   private val shutdownManager = GracefulShutdownManager(...)
 
   def run(): Unit = {
+    // Layer 1: Checkpoint 복구
     val recoveredFromCheckpoint = recoverFromCheckpoint()
 
     if (!recoveredFromCheckpoint) {
       performSampling()
     }
 
+    // Layer 2: 손실된 중간 파일 복구
+    if (recoveredFromCheckpoint) {
+      recoverLostPartitions()  // Replica에서 복구
+    }
+
     // Phase별 checkpoint 저장
     if (currentPhase == PHASE_SORTING) {
       performLocalSort()
       savePhaseCheckpoint(PHASE_SORTING, 1.0)
+
+      // Replication 수행
+      replicateMyPartitions()
 
       performShuffle()
       savePhaseCheckpoint(PHASE_SHUFFLING, 1.0)
@@ -1069,10 +1747,26 @@ class Worker(...) extends ShutdownAware {
     performMerge()
     checkpointManager.deleteAllCheckpoints()
   }
+
+  private def recoverLostPartitions(): Unit = {
+    myPartitions.foreach { partitionId =>
+      if (!partitionFileExists(partitionId)) {
+        replicationManager.recoverFromReplica(partitionId, workerId)
+      }
+    }
+  }
+
+  private def replicateMyPartitions(): Unit = {
+    myPartitions.foreach { partitionId =>
+      val replicas = replicationManager.selectReplicas(partitionId, workerId)
+      val partitionData = loadPartitionData(partitionId)
+      replicationManager.replicatePartition(partitionData, replicas, workerId)
+    }
+  }
 }
 ```
 
-**해결**: Challenge 3 (복구 메커니즘)
+**해결**: Challenge 3 (2-Layer 복구 메커니즘 통합)
 
 ### 5.3 코드 품질 지표
 
@@ -1194,16 +1888,31 @@ $ ./test_mixed_format.sh
 - 리팩토링 시 안전성 보장
 - 예: Record 클래스의 unsigned 비교 버그를 테스트로 먼저 발견
 
-#### Q2: "Checkpoint 기반 복구는 어떻게 동작하나?"
+#### Q2: "2-Layer Fault Tolerance는 어떻게 동작하나?"
 
 **답변**:
+우리는 **Checkpoint + Replication** 2단계 복구 전략을 사용합니다.
+
+**Layer 1: Checkpoint (진행 상태 복구)**
 - **저장**: 각 Phase 완료 시 WorkerState를 JSON으로 자동 저장 (`/tmp/distsort/checkpoints/`)
-- **복구**: Worker 재시작 시 최신 checkpoint 로드 → 마지막 완료 Phase부터 재개
-- **예시**: Shuffle 중 crash → PHASE_SORTING checkpoint 로드 → Shuffle만 재시도 (Sampling/Sort 스킵)
-- **장점**:
-  - 빠른 복구 (전체 재시작 대비 시간 절약)
-  - 정확성 보장 (Phase별 완료 시점 checkpoint)
-  - Graceful Shutdown 통합 (30초 grace period)
+- **복구**: Worker 재시작 시 최신 checkpoint 로드 → 마지막 완료 Phase 확인
+- **내용**: processedRecords, shuffleMap, completedPartitions, phaseMetadata
+
+**Layer 2: Replication (중간 데이터 복구)**
+- **복제**: Phase 2 (Sort & Partition) 완료 후 각 파티션을 다른 Worker에 복제 (replicationFactor=2)
+- **복구**: Worker crash 시 replica에서 손실된 파티션 데이터 복사
+- **검증**: Checksum으로 데이터 무결성 확인
+
+**통합 복구 예시**:
+1. Worker 2가 Shuffle 중 crash
+2. Worker 2' 시작 → Checkpoint 로드 (마지막 Phase: PHASE_SORTING)
+3. ReplicationManager가 Worker 1, 3에서 P6, P7, P8 복구
+4. Shuffle부터 재개 (Sampling/Sort 스킵)
+
+**장점**:
+- ✅ **"All intermediate data is lost" 문제 완전 해결** (슬라이드 요구사항)
+- ✅ 빠른 복구 (전체 재시작 대비 시간 절약)
+- ✅ 정확성 보장 (Checksum + deterministic recovery)
 
 #### Q3: "N→M 전략의 장점은?"
 
@@ -1227,7 +1936,8 @@ $ ./test_mixed_format.sh
 - Week 3: Record 클래스 100% 완료 (5/5 tests passing)
 - Week 4-5: Core I/O Components 100% 완료
   - RecordReader, InputFormatDetector, FileLayout, RecordWriter
-  - ExternalSorter, KWayMerger, CheckpointManager
+  - ExternalSorter, KWayMerger
+  - CheckpointManager, ReplicationManager (2-Layer Fault Tolerance)
 - Week 6: Master/Worker 통합 진행 중
 
 **전체 진행률**: 약 60% (설계 + 핵심 컴포넌트 완료, Master/Worker 통합 진행 중)
@@ -1245,10 +1955,21 @@ $ ./test_mixed_format.sh
 #### Q7: "Challenge 1, 2, 3가 모두 해결되었나?"
 
 **답변**:
-- **Challenge 1 (메모리 제한)**: ✅ ExternalSorter + KWayMerger로 해결
-- **Challenge 2 (분산)**: ✅ Master-Worker + Shuffle로 해결
-- **Challenge 3 (Fault Tolerance)**: ✅ Checkpoint + Graceful Shutdown으로 해결
+- **Challenge 1 (Input > Memory)**: ✅ ExternalSorter + KWayMerger로 해결
+  - 2-Pass External Sort (512MB chunks)
+  - Min-heap 기반 스트리밍 병합
+- **Challenge 2 (Input > Disk, Distributed)**: ✅ Master-Worker + N→M Partition으로 해결
+  - Sort → Partition → Shuffle → Merge
+  - gRPC 기반 worker-to-worker 통신
+- **Challenge 3 ("All intermediate data is lost")**: ✅ **Checkpoint + Replication**으로 완전 해결
+  - Checkpoint: 진행 상태 복구
+  - Replication: 중간 파일 복구 (replicationFactor=2)
+  - 슬라이드 요구사항 충족: "fault-tolerant system"
 - **Additional Requirements**: ✅ 모두 구현 완료
+  - ASCII/Binary 자동 감지 (90% threshold)
+  - 입력 디렉토리 보호 (read-only)
+  - 출력 디렉토리 정리 (cleanup)
+  - 동적 포트 할당
 
 ### 데모 시나리오 (Week 7 이후)
 
