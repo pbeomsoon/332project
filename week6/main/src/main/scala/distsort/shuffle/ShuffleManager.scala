@@ -1,0 +1,378 @@
+package distsort.shuffle
+
+import distsort.core._
+import distsort.replication._
+import org.slf4j.LoggerFactory
+
+import java.io.File
+import java.util.concurrent.{Semaphore, TimeUnit}
+import scala.collection.mutable
+import scala.concurrent.{ExecutionContext, Future, Promise}
+import scala.util.{Failure, Success, Try}
+
+/**
+ * Manages the shuffle phase of distributed sorting
+ * Responsible for:
+ * - Partitioning sorted chunks according to boundaries
+ * - Sending partitions to appropriate workers
+ * - Receiving partitions from other workers
+ * - Managing network transfers with backpressure
+ *
+ * Based on docs/3-grpc-sequences.md Phase 6
+ */
+class ShuffleManager(
+    val workerId: String,
+    val workerIndex: Int,
+    val fileLayout: FileLayout,
+    val partitioner: Partitioner,
+    val maxConcurrentTransfers: Int = 5,
+    val maxRetries: Int = 3,
+    val progressTracker: Option[ShuffleProgressTracker] = None,
+    val replicationEnabled: Boolean = false,
+    val replicationFactor: Int = 2
+)(implicit ec: ExecutionContext) {
+
+  private val logger = LoggerFactory.getLogger(classOf[ShuffleManager])
+  private val transferSemaphore = new Semaphore(maxConcurrentTransfers)
+  private var workerClients: Map[Int, WorkerClient] = Map.empty
+  private var replicationManager: Option[ReplicationManager] = None
+
+  /**
+   * Set worker clients for communication
+   */
+  def setWorkerClients(clients: Map[Int, WorkerClient]): Unit = {
+    workerClients = clients
+
+    // Initialize replication manager if enabled
+    if (replicationEnabled && clients.nonEmpty) {
+      replicationManager = Some(new ReplicationManager(replicationFactor, clients))
+      logger.info(s"Initialized ReplicationManager with factor $replicationFactor")
+    }
+  }
+
+  /**
+   * Main shuffle method - orchestrates the entire shuffle phase
+   *
+   * @param sortedChunks Files containing sorted records
+   * @param assignedPartitions Map of partition ID to worker index
+   * @return Future indicating completion
+   */
+  def shuffleToWorkers(
+      sortedChunks: Seq[File],
+      assignedPartitions: Map[Int, Int]
+  ): Future[Unit] = {
+    logger.info(s"Worker $workerId starting shuffle of ${sortedChunks.size} chunks")
+
+    val shuffleFuture = for {
+      // Step 1: Partition all sorted chunks
+      partitionedData <- Future {
+        partitionSortedChunks(sortedChunks)
+      }
+
+      // Step 2: Send partitions to appropriate workers
+      _ <- sendPartitionsToWorkers(partitionedData, assignedPartitions)
+
+    } yield {
+      progressTracker.foreach(_.markComplete())
+      logger.info(s"Worker $workerId completed shuffle phase")
+    }
+
+    shuffleFuture.recover {
+      case ex: Exception =>
+        logger.error(s"Shuffle failed for worker $workerId", ex)
+        throw ex
+    }
+  }
+
+  /**
+   * Process local partitions without network transfer
+   */
+  def processLocalPartitions(
+      sortedChunks: Seq[File],
+      assignedPartitions: Map[Int, Int]
+  ): Map[Int, Seq[File]] = {
+    val localPartitions = assignedPartitions.filter(_._2 == workerIndex).keys.toSet
+    val result = mutable.Map[Int, mutable.ArrayBuffer[File]]()
+
+    // Process all chunks
+    sortedChunks.foreach { chunk =>
+      val reader = RecordReader.create(chunk)
+      val records = Iterator.continually(reader.readRecord()).takeWhile(_.isDefined).map(_.get)
+
+      val partitioned = partitionRecords(records.toSeq)
+
+      partitioned.foreach { case (partitionId, partRecords) =>
+        if (localPartitions.contains(partitionId)) {
+          val file = fileLayout.getLocalPartitionFile(partitionId)
+          val writer = RecordWriter.create(file, DataFormat.Binary)
+          partRecords.foreach(writer.writeRecord)
+          writer.close()
+
+          result.getOrElseUpdate(partitionId, mutable.ArrayBuffer.empty) += file
+        }
+      }
+      reader.close()
+    }
+
+    // Ensure all local partitions have at least an empty file
+    localPartitions.foreach { partitionId =>
+      if (!result.contains(partitionId)) {
+        val file = fileLayout.getLocalPartitionFile(partitionId)
+        val writer = RecordWriter.create(file, DataFormat.Binary)
+        writer.close() // Create empty file
+        result.getOrElseUpdate(partitionId, mutable.ArrayBuffer.empty) += file
+      }
+    }
+
+    result.map { case (k, v) => k -> v.toSeq }.toMap
+  }
+
+  /**
+   * Partition records using the partitioner
+   */
+  def partitionRecords(records: Seq[Record]): Map[Int, Seq[Record]] = {
+    partitioner.partitionRecords(records)
+  }
+
+  /**
+   * Receive partitions from other workers
+   */
+  def receivePartitions(partitionData: Map[Int, Seq[Record]]): Map[Int, File] = {
+    partitionData.map { case (partitionId, records) =>
+      val file = fileLayout.getReceivedPartitionFile(partitionId, Some(workerId))
+      val writer = RecordWriter.create(file, DataFormat.Binary)
+      records.foreach(writer.writeRecord)
+      writer.close()
+
+      logger.debug(s"Received partition $partitionId with ${records.size} records")
+      progressTracker.foreach(_.recordBytesSent(records.size * 100))
+
+      partitionId -> file
+    }
+  }
+
+  // Private helper methods
+
+  private def partitionSortedChunks(chunks: Seq[File]): Map[Int, Seq[Record]] = {
+    val allPartitioned = mutable.Map[Int, mutable.ArrayBuffer[Record]]()
+
+    chunks.foreach { chunk =>
+      val reader = RecordReader.create(chunk)
+      val records = Iterator.continually(reader.readRecord()).takeWhile(_.isDefined).map(_.get)
+
+      val partitioned = partitionRecords(records.toSeq)
+      partitioned.foreach { case (partitionId, partRecords) =>
+        allPartitioned.getOrElseUpdate(partitionId, mutable.ArrayBuffer.empty) ++= partRecords
+      }
+
+      reader.close()
+    }
+
+    allPartitioned.map { case (k, v) => k -> v.toSeq }.toMap
+  }
+
+  private def sendPartitionsToWorkers(
+      partitionedData: Map[Int, Seq[Record]],
+      assignedPartitions: Map[Int, Int]
+  ): Future[Unit] = {
+    // Create partitions for all assigned partition IDs, even if empty
+    val allPartitionIds = assignedPartitions.keys.toSet
+
+    val sendFutures = allPartitionIds.flatMap { partitionId =>
+      val records = partitionedData.getOrElse(partitionId, Seq.empty)
+      val targetWorker = assignedPartitions.getOrElse(partitionId, workerIndex)
+
+      if (targetWorker == workerIndex) {
+        // Local partition - write directly
+        val file = fileLayout.getLocalPartitionFile(partitionId)
+        val writer = RecordWriter.create(file, DataFormat.Binary)
+        records.foreach(writer.writeRecord)
+        writer.close()
+        logger.debug(s"Kept partition $partitionId locally with ${records.size} records")
+        progressTracker.foreach { tracker =>
+          tracker.recordBytesSent(records.size * 100L)
+        }
+        None
+      } else {
+        // Remote partition - send to target worker
+        Some(sendPartitionWithRetry(partitionId, records, targetWorker))
+      }
+    }
+
+    Future.sequence(sendFutures).map(_ => ())
+  }
+
+  private def sendPartitionWithRetry(
+      partitionId: Int,
+      records: Seq[Record],
+      targetWorker: Int,
+      attempt: Int = 1
+  ): Future[Unit] = {
+    val promise = Promise[Unit]()
+
+    // Acquire semaphore before creating Future (for proper backpressure)
+    transferSemaphore.acquire()
+
+    Future {
+      try {
+        val client = workerClients.getOrElse(targetWorker,
+          throw new IllegalStateException(s"No client for worker $targetWorker"))
+
+        logger.debug(s"Sending partition $partitionId to worker $targetWorker (attempt $attempt)")
+
+        client.sendPartition(partitionId, records.iterator).onComplete {
+          case Success(true) =>
+            logger.info(s"Successfully sent partition $partitionId to worker $targetWorker")
+            progressTracker.foreach { tracker =>
+              tracker.recordPartitionSent()
+              tracker.recordBytesSent(records.size * 100)
+            }
+
+            // Replicate if enabled
+            replicationManager match {
+              case Some(manager) =>
+                val replicas = manager.selectReplicas(partitionId, targetWorker)
+                if (replicas.nonEmpty) {
+                  logger.info(s"Replicating partition $partitionId to ${replicas.size} backup workers")
+                  val partitionData = PartitionData(
+                    id = partitionId,
+                    records = records,
+                    checksum = calculateChecksum(records),
+                    metadata = Map("primary" -> targetWorker.toString)
+                  )
+                  manager.replicatePartition(partitionData, replicas, targetWorker)
+                    .onComplete {
+                      case Success(_) =>
+                        logger.debug(s"Partition $partitionId replicated successfully")
+                      case Failure(ex) =>
+                        logger.warn(s"Failed to replicate partition $partitionId: ${ex.getMessage}")
+                    }
+                }
+
+              case None => // No replication
+            }
+
+            promise.success(())
+
+          case Success(false) if attempt < maxRetries =>
+            val backoffMs = Math.pow(2, attempt).toLong * 1000
+            logger.warn(s"Failed to send partition $partitionId, retrying after ${backoffMs}ms")
+            Thread.sleep(backoffMs)
+            // Release semaphore before retry
+            transferSemaphore.release()
+            sendPartitionWithRetry(partitionId, records, targetWorker, attempt + 1)
+              .onComplete(promise.complete)
+
+          case Failure(_) if attempt < maxRetries =>
+            val backoffMs = Math.pow(2, attempt).toLong * 1000
+            logger.warn(s"Failed to send partition $partitionId, retrying after ${backoffMs}ms")
+            Thread.sleep(backoffMs)
+            // Release semaphore before retry
+            transferSemaphore.release()
+            sendPartitionWithRetry(partitionId, records, targetWorker, attempt + 1)
+              .onComplete(promise.complete)
+
+          case Success(false) =>
+            val ex = new RuntimeException(s"Worker rejected partition $partitionId")
+            logger.error(s"Failed to send partition $partitionId after $maxRetries attempts", ex)
+            promise.failure(ex)
+
+          case Failure(ex) =>
+            logger.error(s"Failed to send partition $partitionId after $maxRetries attempts", ex)
+            promise.failure(ex)
+        }
+      } finally {
+        transferSemaphore.release()
+      }
+    }
+
+    promise.future
+  }
+
+  /**
+   * Calculate checksum for records
+   */
+  private def calculateChecksum(records: Seq[Record]): String = {
+    import java.security.MessageDigest
+    val md = MessageDigest.getInstance("MD5")
+    records.foreach { record =>
+      md.update(record.key)
+      md.update(record.value)
+    }
+    md.digest().map("%02x".format(_)).mkString
+  }
+
+  /**
+   * Get replication status
+   */
+  def getReplicationStatus(partitionId: Int): Option[ReplicationMetadata] = {
+    replicationManager.flatMap(_.getReplicationStatus(partitionId))
+  }
+
+  /**
+   * Recover partition from backup
+   */
+  def recoverPartition(partitionId: Int, failedWorker: Int): Future[Option[PartitionData]] = {
+    replicationManager match {
+      case Some(manager) =>
+        manager.recoverFromBackup(partitionId, failedWorker).map(Some(_))
+      case None =>
+        Future.successful(None)
+    }
+  }
+
+  /**
+   * Cleanup resources - close all worker client connections
+   */
+  def cleanup(): Unit = {
+    logger.info(s"Cleaning up ShuffleManager resources (${workerClients.size} worker clients)...")
+
+    // Close all worker clients in parallel with timeout
+    val closeStartTime = System.currentTimeMillis()
+
+    workerClients.values.foreach { client =>
+      try {
+        // Check if we've been cleaning up for too long
+        val elapsed = System.currentTimeMillis() - closeStartTime
+        if (elapsed > 5000) { // 5 second total timeout
+          logger.warn(s"Cleanup taking too long (${elapsed}ms), skipping remaining clients")
+          return
+        }
+
+        client.close()
+      } catch {
+        case ex: Exception =>
+          logger.debug(s"Error closing worker client: ${ex.getMessage}")
+      }
+    }
+
+    workerClients = Map.empty
+    logger.info("ShuffleManager cleanup complete")
+  }
+
+}
+
+/**
+ * Tracks shuffle progress
+ */
+class ShuffleProgressTracker {
+  private val bytesSent = new java.util.concurrent.atomic.AtomicLong(0)
+  private val partitionsSent = new java.util.concurrent.atomic.AtomicInteger(0)
+  @volatile private var complete: Boolean = false
+
+  def recordBytesSent(bytes: Long): Unit = {
+    bytesSent.addAndGet(bytes)
+  }
+
+  def recordPartitionSent(): Unit = {
+    partitionsSent.incrementAndGet()
+  }
+
+  def markComplete(): Unit = {
+    complete = true
+  }
+
+  def getTotalBytesSent: Long = bytesSent.get()
+  def getPartitionsSent: Int = partitionsSent.get()
+  def isComplete: Boolean = complete
+}

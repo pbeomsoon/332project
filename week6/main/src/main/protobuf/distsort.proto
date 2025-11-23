@@ -1,0 +1,200 @@
+syntax = "proto3";
+
+package distsort;
+
+option java_package = "distsort.proto";
+option java_outer_classname = "DistsortProto";
+
+// Common messages
+message Empty {}
+
+// Worker registration
+message RegisterWorkerRequest {
+  string worker_id = 1;
+  string host = 2;
+  int32 port = 3;
+  int32 num_cores = 4;
+  int64 available_memory = 5;
+}
+
+message RegisterWorkerResponse {
+  bool success = 1;
+  string message = 2;
+  int32 assigned_worker_index = 3;
+}
+
+// Sample keys submission
+message SampleKeysRequest {
+  string worker_id = 1;
+  repeated bytes keys = 2;
+  int32 total_records_processed = 3;
+}
+
+message SampleKeysResponse {
+  bool acknowledged = 1;
+}
+
+// Partition configuration
+message PartitionConfigRequest {
+  string worker_id = 1;
+}
+
+message PartitionConfigResponse {
+  repeated bytes boundaries = 1;
+  int32 num_partitions = 2;
+  repeated int32 worker_partition_assignments = 3; // Which partitions this worker should merge
+  repeated WorkerInfo all_workers = 4; // Information about all workers
+  map<int32, int32> shuffle_map = 5; // Partition ID -> Worker Index mapping
+}
+
+// Phase management
+enum WorkerPhase {
+  PHASE_UNKNOWN = 0;
+  PHASE_INITIALIZING = 1;
+  PHASE_SAMPLING = 2;
+  PHASE_WAITING_FOR_PARTITIONS = 3;
+  PHASE_SORTING = 4;
+  PHASE_SHUFFLING = 5;
+  PHASE_MERGING = 6;
+  PHASE_COMPLETED = 7;
+  PHASE_FAILED = 8;
+}
+
+message PhaseCompleteRequest {
+  string worker_id = 1;
+  WorkerPhase phase = 2;
+  string details = 3;
+}
+
+message PhaseCompleteResponse {
+  bool proceed_to_next = 1;
+  WorkerPhase next_phase = 2;
+  string message = 3;
+}
+
+// Worker status
+message WorkerStatusRequest {
+  string requester_id = 1;
+}
+
+message WorkerStatusResponse {
+  string worker_id = 1;
+  WorkerPhase current_phase = 2;
+  int32 records_processed = 3;
+  int32 partitions_received = 4;
+  int32 partitions_sent = 5;
+  bool is_healthy = 6;
+}
+
+// Shuffle data transfer (streaming)
+message ShuffleDataChunk {
+  int32 partition_id = 1;
+  bytes data = 2;
+  int32 chunk_index = 3;
+  int64 total_bytes = 4;
+  bool is_last = 5;
+}
+
+message ShuffleAck {
+  bool success = 1;
+  string message = 2;
+  int64 bytes_received = 3;
+}
+
+// Legacy shuffle messages (kept for compatibility)
+message ShuffleRequest {
+  string sender_worker_id = 1;
+  string target_worker_id = 2;
+  int32 partition_id = 3;
+  bytes data = 4;
+  int32 sequence_number = 5;
+  bool is_last_chunk = 6;
+}
+
+message ShuffleResponse {
+  bool acknowledged = 1;
+  int32 buffer_capacity = 2; // For backpressure
+}
+
+// Phase start signals
+message StartPhaseRequest {
+  WorkerPhase phase = 1;
+  string details = 2;
+}
+
+message StartPhaseResponse {
+  bool started = 1;
+  string message = 2;
+}
+
+// Worker information
+message WorkerInfo {
+  string worker_id = 1;
+  string host = 2;
+  int32 port = 3;
+  int32 worker_index = 4;
+}
+
+// Error reporting
+message ReportErrorRequest {
+  string worker_id = 1;
+  string error_type = 2;
+  string error_message = 3;
+  WorkerPhase phase_when_error_occurred = 4;
+}
+
+message ReportErrorResponse {
+  bool should_retry = 1;
+  bool should_abort = 2;
+  string instructions = 3;
+}
+
+// Heartbeat mechanism
+message HeartbeatRequest {
+  string worker_id = 1;
+  WorkerPhase current_phase = 2;
+  double progress_percentage = 3;
+  int64 timestamp = 4;
+}
+
+message HeartbeatResponse {
+  bool acknowledged = 1;
+  bool should_abort = 2;
+  string message = 3;
+}
+
+// Master Service
+service MasterService {
+  // Worker registration and management
+  rpc RegisterWorker(RegisterWorkerRequest) returns (RegisterWorkerResponse);
+
+  // Sample key collection
+  rpc SubmitSampleKeys(SampleKeysRequest) returns (SampleKeysResponse);
+
+  // Partition configuration distribution
+  rpc GetPartitionConfig(PartitionConfigRequest) returns (PartitionConfigResponse);
+
+  // Phase synchronization
+  rpc ReportPhaseComplete(PhaseCompleteRequest) returns (PhaseCompleteResponse);
+
+  // Error handling
+  rpc ReportError(ReportErrorRequest) returns (ReportErrorResponse);
+
+  // Heartbeat for worker health monitoring
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+}
+
+// Worker Service
+service WorkerService {
+  // Status monitoring
+  rpc GetWorkerStatus(WorkerStatusRequest) returns (WorkerStatusResponse);
+
+  // Phase control
+  rpc StartPhase(StartPhaseRequest) returns (StartPhaseResponse);
+
+  // Shuffle data reception (streaming)
+  rpc ShuffleData(stream ShuffleDataChunk) returns (ShuffleAck);
+
+  // Legacy shuffle data reception
+  rpc ReceiveShuffleData(stream ShuffleRequest) returns (stream ShuffleResponse);
+}

@@ -1,0 +1,25 @@
+#!/bin/bash
+# Worker launcher script
+# Usage: worker <master IP:port> -I <input dirs> -O <output dir>
+
+# Project directory (change to main directory)
+PROJECT_DIR="$HOME/main"
+cd "$PROJECT_DIR"
+
+if [ $# -lt 2 ]; then
+    echo "Usage: $0 <master IP:port> -I <input directory> ... -O <output directory>" >&2
+    echo "Example: $0 localhost:50051 -I input1 input2 -O output" >&2
+    exit 1
+fi
+
+# Check if JAR exists
+JAR_FILE="$PROJECT_DIR/target/scala-2.13/distsort.jar"
+
+if [ -f "$JAR_FILE" ]; then
+    # Clean output - no startup messages
+    java -Djava.net.preferIPv4Stack=true -cp "$JAR_FILE" distsort.worker.Worker "$@"
+else
+    echo "JAR not found. Using sbt (slow - 14min startup)..." >&2
+    echo "Tip: Run 'sbt assembly' once to build JAR for fast startup" >&2
+    sbt "runMain distsort.worker.Worker $@"
+fi

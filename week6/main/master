@@ -1,0 +1,27 @@
+#!/bin/bash
+# Master launcher script
+# Usage: master <number of workers>
+
+# Project directory (change to main directory)
+PROJECT_DIR="$HOME/main"
+cd "$PROJECT_DIR"
+
+if [ $# -lt 1 ]; then
+    echo "Usage: $0 <number of workers>" >&2
+    echo "Example: $0 3" >&2
+    exit 1
+fi
+
+NUM_WORKERS="$1"
+
+# Check if JAR exists
+JAR_FILE="$PROJECT_DIR/target/scala-2.13/distsort.jar"
+
+if [ -f "$JAR_FILE" ]; then
+    # Clean output - no startup messages
+    java -Djava.net.preferIPv4Stack=true -cp "$JAR_FILE" distsort.master.Master "$NUM_WORKERS"
+else
+    echo "JAR not found. Using sbt (slow - 14min startup)..." >&2
+    echo "Tip: Run 'sbt assembly' once to build JAR for fast startup" >&2
+    sbt "runMain distsort.master.Master $NUM_WORKERS"
+fi
