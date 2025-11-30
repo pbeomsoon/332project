@@ -54,6 +54,7 @@ class ShuffleManager(
 
   /**
    * Main shuffle method - orchestrates the entire shuffle phase
+   * ⭐ FIX: Uses streaming approach to avoid loading all data into memory
    *
    * @param sortedChunks Files containing sorted records
    * @param assignedPartitions Map of partition ID to worker index
@@ -66,13 +67,13 @@ class ShuffleManager(
     logger.info(s"Worker $workerId starting shuffle of ${sortedChunks.size} chunks")
 
     val shuffleFuture = for {
-      // Step 1: Partition all sorted chunks
-      partitionedData <- Future {
-        partitionSortedChunks(sortedChunks)
+      // Step 1: Partition sorted chunks to temporary files (streaming, low memory)
+      partitionFiles <- Future {
+        partitionSortedChunksToFiles(sortedChunks, assignedPartitions)
       }
 
-      // Step 2: Send partitions to appropriate workers
-      _ <- sendPartitionsToWorkers(partitionedData, assignedPartitions)
+      // Step 2: Send partition files to appropriate workers
+      _ <- sendPartitionFilesToWorkers(partitionFiles, assignedPartitions)
 
     } yield {
       progressTracker.foreach(_.markComplete())
@@ -155,6 +156,120 @@ class ShuffleManager(
 
   // Private helper methods
 
+  /**
+   * ⭐ FIX: Streaming partition - writes to files instead of holding in memory
+   * Processes each chunk one at a time and writes partitioned data to temp files
+   */
+  private def partitionSortedChunksToFiles(
+      chunks: Seq[File],
+      assignedPartitions: Map[Int, Int]
+  ): Map[Int, File] = {
+    import java.io.BufferedOutputStream
+
+    // Create temp files and writers for each partition
+    val partitionWriters = mutable.Map[Int, (File, RecordWriter)]()
+
+    def getWriter(partitionId: Int): RecordWriter = {
+      partitionWriters.getOrElseUpdate(partitionId, {
+        val file = new File(fileLayout.getTempBasePath.toFile, s"shuffle-partition-$partitionId.tmp")
+        val writer = RecordWriter.create(file, DataFormat.Binary)
+        (file, writer)
+      })._2
+    }
+
+    try {
+      // Stream through each chunk and partition records
+      chunks.foreach { chunk =>
+        val reader = RecordReader.create(chunk)
+        try {
+          var record = reader.readRecord()
+          while (record.isDefined) {
+            val r = record.get
+            val partitionId = partitioner.getPartition(r.key)
+            getWriter(partitionId).writeRecord(r)
+            record = reader.readRecord()
+          }
+        } finally {
+          reader.close()
+        }
+      }
+
+      // Close all writers
+      partitionWriters.values.foreach { case (_, writer) =>
+        writer.close()
+      }
+
+      // Return partition ID -> file mapping
+      partitionWriters.map { case (pid, (file, _)) => pid -> file }.toMap
+
+    } catch {
+      case ex: Exception =>
+        // Clean up on error
+        partitionWriters.values.foreach { case (_, writer) =>
+          try { writer.close() } catch { case _: Exception => }
+        }
+        throw ex
+    }
+  }
+
+  /**
+   * ⭐ FIX: Send partition files instead of in-memory data
+   * Reads from files and streams to target workers
+   */
+  private def sendPartitionFilesToWorkers(
+      partitionFiles: Map[Int, File],
+      assignedPartitions: Map[Int, Int]
+  ): Future[Unit] = {
+    val allPartitionIds = assignedPartitions.keys.toSet
+
+    val sendFutures = allPartitionIds.flatMap { partitionId =>
+      val targetWorker = assignedPartitions.getOrElse(partitionId, workerIndex)
+      val partitionFile = partitionFiles.get(partitionId)
+
+      if (targetWorker == workerIndex) {
+        // Local partition - move/copy file to local partition location
+        partitionFile.foreach { srcFile =>
+          val destFile = fileLayout.getLocalPartitionFile(partitionId)
+          if (srcFile.exists()) {
+            java.nio.file.Files.copy(
+              srcFile.toPath,
+              destFile.toPath,
+              java.nio.file.StandardCopyOption.REPLACE_EXISTING
+            )
+            srcFile.delete() // Clean up temp file
+            val size = destFile.length()
+            logger.debug(s"Kept partition $partitionId locally ($size bytes)")
+            progressTracker.foreach(_.recordBytesSent(size))
+          }
+        }
+        None
+      } else {
+        // Remote partition - read from file and send
+        partitionFile match {
+          case Some(file) if file.exists() =>
+            // Read records from file for sending
+            val reader = RecordReader.create(file)
+            val records = Iterator.continually(reader.readRecord())
+              .takeWhile(_.isDefined)
+              .map(_.get)
+              .toSeq
+            reader.close()
+            file.delete() // Clean up temp file
+
+            Some(sendPartitionWithRetry(partitionId, records, targetWorker))
+
+          case _ =>
+            // Empty partition
+            Some(sendPartitionWithRetry(partitionId, Seq.empty, targetWorker))
+        }
+      }
+    }
+
+    Future.sequence(sendFutures).map(_ => ())
+  }
+
+  // Legacy methods kept for compatibility
+
   private def partitionSortedChunks(chunks: Seq[File]): Map[Int, Seq[Record]] = {
     val allPartitioned = mutable.Map[Int, mutable.ArrayBuffer[Record]]()
 
@@ -209,15 +324,27 @@ class ShuffleManager(
    * Called before retry to get updated worker endpoints when a worker recovers
    *
    * ⭐ IMPORTANT: This is called when sendPartition fails, to check if a recovery worker joined
+   * ⭐ FIX: Close old clients before replacing to prevent gRPC channel leaks
    */
   private def refreshWorkerClients(): Unit = {
     refreshClientsCallback.foreach { callback =>
       try {
         val oldClientKeys = workerClients.keySet
+        val oldClients = workerClients
         val newClients = callback()
 
         if (newClients.nonEmpty) {
-          // Always update clients (endpoints may have changed even if keys are same)
+          // ⭐ FIX: Close old clients to prevent channel leaks
+          oldClients.values.foreach { client =>
+            try {
+              client.close()
+            } catch {
+              case ex: Exception =>
+                logger.debug(s"Error closing old client: ${ex.getMessage}")
+            }
+          }
+
+          // Update to new clients
           workerClients = newClients
 
           // Log if client set changed (for debugging)
@@ -241,6 +368,23 @@ class ShuffleManager(
       targetWorker: Int,
       attempt: Int = 1
   ): Future[Unit] = {
+    // ⭐ FIX: Check for client BEFORE creating Future
+    // If client is missing (worker crashed), refresh and retry without blocking semaphore
+    val clientOpt = workerClients.get(targetWorker)
+
+    if (clientOpt.isEmpty) {
+      if (attempt < maxRetries) {
+        logger.warn(s"No client for worker $targetWorker (attempt $attempt/$maxRetries), " +
+          s"refreshing and retrying in ${retryIntervalMs}ms - Worker may have crashed, waiting for recovery...")
+        Thread.sleep(retryIntervalMs)
+        refreshWorkerClients()
+        return sendPartitionWithRetry(partitionId, records, targetWorker, attempt + 1)
+      } else {
+        return Future.failed(new IllegalStateException(s"No client for worker $targetWorker after $maxRetries attempts"))
+      }
+    }
+
+    val client = clientOpt.get
     val promise = Promise[Unit]()
 
     // Acquire semaphore before creating Future (for proper backpressure)
@@ -248,9 +392,6 @@ class ShuffleManager(
 
     Future {
       try {
-        val client = workerClients.getOrElse(targetWorker,
-          throw new IllegalStateException(s"No client for worker $targetWorker"))
-
         logger.debug(s"Sending partition $partitionId to worker $targetWorker (attempt $attempt)")
 
         client.sendPartition(partitionId, records.iterator).onComplete {

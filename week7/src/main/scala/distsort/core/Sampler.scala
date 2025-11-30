@@ -101,6 +101,71 @@ class Sampler(
   }
 
   /**
+   * ⭐ Extract samples from a specific record range within a file
+   *
+   * This supports record-level distribution where each worker reads only
+   * its assigned portion of the file.
+   *
+   * @param file Input file
+   * @param startRecord Starting record index (0-based)
+   * @param recordCount Number of records to read from this range
+   * @return Sampled records from the specified range
+   */
+  def extractSamplesFromRange(file: File, startRecord: Long, recordCount: Long): Seq[Record] = {
+    import java.io.RandomAccessFile
+    val RECORD_SIZE = 100L  // 10 byte key + 90 byte value
+
+    try {
+      val raf = new RandomAccessFile(file, "r")
+      try {
+        // Seek to start of the assigned range
+        val startOffset = startRecord * RECORD_SIZE
+        raf.seek(startOffset)
+
+        val samples = ArrayBuffer[Record]()
+        var recordsRead = 0L
+        var firstRecord: Option[Record] = None
+        val buffer = new Array[Byte](RECORD_SIZE.toInt)
+
+        // Read records from the assigned range
+        while (recordsRead < recordCount && raf.getFilePointer < raf.length()) {
+          val bytesRead = raf.read(buffer)
+          if (bytesRead == RECORD_SIZE) {
+            val key = buffer.slice(0, 10).clone()
+            val value = buffer.slice(10, 100).clone()
+            val record = Record(key, value)
+
+            recordsRead += 1
+
+            // Keep first record in case we sample nothing
+            if (recordsRead == 1) {
+              firstRecord = Some(record)
+            }
+
+            // Simple random sampling
+            if (random.nextDouble() < sampleRate) {
+              samples += record
+            }
+          }
+        }
+
+        // Ensure at least one sample if we read any records
+        if (samples.isEmpty && firstRecord.isDefined) {
+          samples += firstRecord.get
+        }
+
+        samples.toSeq
+      } finally {
+        raf.close()
+      }
+    } catch {
+      case ex: Exception =>
+        // Fallback to reading entire file if seek fails
+        extractSamples(file)
+    }
+  }
+
+  /**
    * Extract samples using reservoir sampling
    * More memory efficient for large files
    *

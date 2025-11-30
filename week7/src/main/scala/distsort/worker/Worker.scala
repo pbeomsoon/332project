@@ -83,6 +83,12 @@ class Worker(
   private var workerConfiguration: Option[PartitionConfigResponse] = None
   private var shuffleMap: Map[Int, Int] = Map.empty
 
+  // ⭐ Record-level distribution: assigned record ranges for this worker
+  // Each record range specifies: (file, start_record, record_count)
+  case class RecordRangeLocal(file: File, startRecord: Long, recordCount: Long)
+  @volatile private var assignedRecordRanges: Seq[RecordRangeLocal] = Seq.empty
+  @volatile private var fileAssignmentReceived: Boolean = false
+
   // Recovery state (Slide 13: Worker crash recovery)
   @volatile private var isRecovery: Boolean = false
   @volatile private var recoveryStartPhase: WorkerPhase = WorkerPhase.PHASE_INITIALIZING
@@ -198,6 +204,96 @@ class Worker(
   }
 
   /**
+   * ⭐ Get record range assignment from Master
+   * Called after registration but before sampling to get assigned record ranges.
+   * This ensures each RECORD is processed by exactly one worker (no duplicates).
+   */
+  private def getFileAssignment(): Unit = {
+    logger.info(s"Worker $workerId: Getting record range assignment from Master")
+
+    val maxRetries = 30  // 30 retries × 1 second = 30 seconds max wait
+    var retries = 0
+    var success = false
+
+    while (!success && retries < maxRetries) {
+      try {
+        val request = GetFileAssignmentRequest(workerId)
+        val responseFuture = masterClient.getFileAssignment(request)
+        val response = Await.result(responseFuture, 30.seconds)
+
+        if (response.ready) {
+          // ⭐ Parse record ranges (new format)
+          if (response.recordRanges.nonEmpty) {
+            assignedRecordRanges = response.recordRanges.map { range =>
+              RecordRangeLocal(
+                file = new File(range.filePath),
+                startRecord = range.startRecord,
+                recordCount = range.recordCount
+              )
+            }
+            val totalRecords = assignedRecordRanges.map(_.recordCount).sum
+            val uniqueFiles = assignedRecordRanges.map(_.file.getName).distinct
+            logger.info(s"⭐ Worker $workerId assigned $totalRecords records from ${assignedRecordRanges.size} range(s)")
+            System.err.println(s"[Worker-$workerIndex] ⭐ Assigned $totalRecords records from ${uniqueFiles.size} file(s)")
+          } else {
+            // Legacy fallback: use file paths if no record ranges
+            assignedRecordRanges = response.assignedFiles.map { path =>
+              val file = new File(path)
+              RecordRangeLocal(file, 0, file.length() / 100)  // All records in file
+            }
+            logger.info(s"⭐ Worker $workerId assigned ${response.assignedFiles.size} files (legacy mode)")
+            System.err.println(s"[Worker-$workerIndex] ⭐ Assigned ${response.assignedFiles.size} files (legacy)")
+          }
+          fileAssignmentReceived = true
+          success = true
+        } else {
+          // Record distribution not done yet - wait and retry
+          logger.info(s"Record distribution not ready, waiting... (${response.message})")
+          Thread.sleep(1000)
+          retries += 1
+        }
+      } catch {
+        case ex: Exception =>
+          logger.warn(s"Failed to get record assignment (attempt ${retries + 1}): ${ex.getMessage}")
+          Thread.sleep(1000)
+          retries += 1
+      }
+    }
+
+    if (!success) {
+      // Fallback: use all input files (for backward compatibility or single-worker mode)
+      logger.warn(s"Could not get record assignment after $maxRetries attempts, using all input files")
+      assignedRecordRanges = fileLayout.getInputFiles.map { file =>
+        RecordRangeLocal(file, 0, file.length() / 100)  // All records
+      }
+      fileAssignmentReceived = true
+      System.err.println(s"[Worker-$workerIndex] ⚠️ Using all input files (no distribution)")
+    }
+  }
+
+  /**
+   * Get assigned record ranges (for use in sampling/sorting)
+   * Falls back to all input files if assignment not received
+   */
+  private def getAssignedRecordRanges: Seq[RecordRangeLocal] = {
+    if (fileAssignmentReceived && assignedRecordRanges.nonEmpty) {
+      assignedRecordRanges
+    } else {
+      // Fallback for backward compatibility - all records from all files
+      fileLayout.getInputFiles.map { file =>
+        RecordRangeLocal(file, 0, file.length() / 100)
+      }
+    }
+  }
+
+  /**
+   * Get assigned input files (legacy - returns unique files from record ranges)
+   */
+  private def getAssignedInputFiles: Seq[File] = {
+    getAssignedRecordRanges.map(_.file).distinct
+  }
+
+  /**
    * Register with master with exponential backoff retry
    */
   private def registerWithMaster(retries: Int = 5, delayMs: Long = 1000): Unit = {
@@ -205,13 +301,23 @@ class Worker(
       // Calculate input size for dynamic partitioning
       val totalInputBytes = calculateTotalInputSize()
 
+      // ⭐ Collect input file info WITH sizes (for record-level distribution)
+      val inputFiles = fileLayout.getInputFiles
+      val inputFilePaths = inputFiles.map(_.getAbsolutePath)
+      val inputFileInfos = inputFiles.map { file =>
+        InputFileInfo(filePath = file.getAbsolutePath, fileSize = file.length())
+      }
+      logger.info(s"Reporting ${inputFilePaths.size} input files (${totalInputBytes / 1024 / 1024}MB) to Master for distribution")
+
       val registerRequest = RegisterWorkerRequest(
         workerId,
         myHost,  // Use detected IP address
         actualPort,
         Runtime.getRuntime.availableProcessors(),
         Runtime.getRuntime.maxMemory(),
-        totalInputBytes  // NEW: Send input size for dynamic partitioning
+        totalInputBytes,  // Send input size for dynamic partitioning
+        inputFilePaths,   // Legacy: file paths only
+        inputFileInfos    // ⭐ NEW: file paths WITH sizes for record-level distribution
       )
 
       val responseFuture = masterClient.registerWorker(registerRequest)
@@ -375,6 +481,11 @@ class Worker(
           false
       }
 
+      // ⭐ Get file assignment from Master before any processing
+      // This ensures each file is processed by exactly one worker (no duplicates)
+      // For recovery workers, they get the crashed worker's assigned files
+      getFileAssignment()
+
       // ⭐ RECOVERY LOGIC (Slide 13: Worker crash recovery)
       // Recovery worker behavior depends on which phase Master is currently in:
       // - SAMPLING: Must do sampling (boundaries not yet computed)
@@ -488,11 +599,14 @@ class Worker(
     System.err.println(s"[Worker-$workerIndex] Phase 1/4: Sampling...")
     workerService.setPhase(WorkerPhase.PHASE_SAMPLING)
 
-    val inputFiles = fileLayout.getInputFiles
-    logger.info(s"Found ${inputFiles.length} input files")
+    // ⭐ Use assigned RECORD RANGES (distributed by Master) for sampling
+    val recordRanges = getAssignedRecordRanges
+    val totalRecords = recordRanges.map(_.recordCount).sum
+    logger.info(s"Sampling from $totalRecords assigned records in ${recordRanges.size} range(s)")
 
-    val allSamples = inputFiles.flatMap { file =>
-      sampler.extractSamples(file)
+    // Extract samples from each record range
+    val allSamples = recordRanges.flatMap { range =>
+      sampler.extractSamplesFromRange(range.file, range.startRecord, range.recordCount)
     }
 
     logger.info(s"Extracted ${allSamples.length} samples")
@@ -576,8 +690,8 @@ class Worker(
         throw new RuntimeException(s"Cannot find worker info for index $requesterIndex")
       }
 
-      // Read input files and partition records
-      val inputFiles = fileLayout.getInputFiles
+      // ⭐ Read ASSIGNED RECORD RANGES (distributed by Master) and partition records
+      val recordRanges = getAssignedRecordRanges
       val thePartitioner = partitioner.getOrElse {
         throw new RuntimeException("Partitioner not initialized")
       }
@@ -591,13 +705,31 @@ class Worker(
       )
 
       try {
-        inputFiles.foreach { inputFile =>
-          val reader = distsort.core.RecordReader.create(inputFile)
-          val records = Iterator.continually(reader.readRecord()).takeWhile(_.isDefined).map(_.get).toSeq
-          reader.close()
+        // ⭐ Read only assigned record ranges (not entire files)
+        recordRanges.foreach { range =>
+          import java.io.RandomAccessFile
+          val RECORD_SIZE = 100
+          val raf = new RandomAccessFile(range.file, "r")
+          val records = scala.collection.mutable.ArrayBuffer[distsort.core.Record]()
+          try {
+            raf.seek(range.startRecord * RECORD_SIZE)
+            val buffer = new Array[Byte](RECORD_SIZE)
+            var recordsRead = 0L
+            while (recordsRead < range.recordCount && raf.getFilePointer < raf.length()) {
+              val bytesRead = raf.read(buffer)
+              if (bytesRead == RECORD_SIZE) {
+                val key = buffer.slice(0, 10).clone()
+                val value = buffer.slice(10, 100).clone()
+                records += distsort.core.Record(key, value)
+                recordsRead += 1
+              }
+            }
+          } finally {
+            raf.close()
+          }
 
           // Partition records
-          val partitionedRecords = thePartitioner.partitionRecords(records)
+          val partitionedRecords = thePartitioner.partitionRecords(records.toSeq)
 
           // Send only requested partitions
           partitionedRecords.foreach { case (partitionId, partRecords) =>
@@ -687,16 +819,23 @@ class Worker(
 
   /**
    * Phase 3: Perform local sort on input data
+   * ⭐ Uses record-level distribution: reads only assigned record ranges
    */
   private def performLocalSort(): Seq[File] = {
     logger.info(s"Worker $workerId: Starting local sort phase")
     System.err.println(s"[Worker-$workerIndex] Phase 2/4: Sorting...")
     workerService.setPhase(WorkerPhase.PHASE_SORTING)
 
-    val inputFiles = fileLayout.getInputFiles
-    val sortedChunks = sorter.sortFiles(inputFiles)
+    // ⭐ Use assigned RECORD RANGES (distributed by Master) for sorting
+    val recordRanges = getAssignedRecordRanges
+    val totalRecords = recordRanges.map(_.recordCount).sum
+    logger.info(s"Sorting $totalRecords assigned records from ${recordRanges.size} range(s)")
 
-    logger.info(s"Sorted ${inputFiles.length} files into ${sortedChunks.length} chunks")
+    // Convert to tuple format for sorter
+    val ranges = recordRanges.map(r => (r.file, r.startRecord, r.recordCount))
+    val sortedChunks = sorter.sortRecordRanges(ranges)
+
+    logger.info(s"Sorted $totalRecords records into ${sortedChunks.length} chunks")
 
     System.err.println(s"[Worker-$workerIndex] Sorting complete (${sortedChunks.length} chunks)")
     reportPhaseComplete(WorkerPhase.PHASE_SORTING)
@@ -833,7 +972,14 @@ class Worker(
       // Merge using KWayMerger
       assignedPartitionsList.foreach { partitionId =>
         // Filter files for this partition
-        val partitionFiles = allFiles.filter(_.getName.contains(s".$partitionId"))
+        // ⭐ FIX: Match both local files and received files (with unique sender IDs)
+        // Local: local-partition.0
+        // Received: partition-0-abc12345.received (unique per sender)
+        val partitionFiles = allFiles.filter { file =>
+          val name = file.getName
+          name.contains(s".$partitionId") ||                     // local-partition.0
+          name.matches(s"partition-$partitionId-.*\\.received")  // partition-0-UUID.received
+        }
 
         if (partitionFiles.nonEmpty) {
           val outputFile = fileLayout.getOutputPartitionFile(partitionId)

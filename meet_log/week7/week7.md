@@ -439,5 +439,133 @@ MISSED_HEARTBEAT_THRESHOLD = 2
 
 ---
 
+## 9. 추가 작업 (2025-11-30 오후)
+
+### 9.1 레코드 단위 분배 (Record-Level Distribution) 구현
+
+**문제:**
+- 여러 Worker가 같은 input 디렉토리 사용 시 데이터 중복 처리
+- Worker 수 > 파일 수 일 때 일부 Worker가 처리할 데이터 없음
+
+**해결:**
+```scala
+// Proto 추가
+message FileRecordRange {
+  string file_path = 1;
+  int64 start_record = 2;
+  int64 record_count = 3;
+}
+
+// MasterService: 레코드 단위 분배
+case class RecordRange(filePath: String, startRecord: Long, recordCount: Long)
+// 각 Worker에게 레코드 범위 할당
+
+// Worker: 할당된 범위만 처리
+sampler.extractSamplesFromRange(file, startRecord, recordCount)
+sorter.sortRecordRanges(ranges)
+```
+
+### 9.2 Shuffle 데이터 병합 버그 수정
+
+**문제:** 다른 Worker에서 받은 shuffle 데이터가 merge에 포함되지 않음
+
+**원인:** 파일명 패턴 불일치
+- 수신 파일: `partition-0.received`
+- 필터: `.0` 패턴 검색 (불일치!)
+
+**해결:**
+```scala
+val partitionFiles = allFiles.filter { file =>
+  name.contains(s".$partitionId") ||
+  name.matches(s"partition-$partitionId-.*\\.received")
+}
+```
+
+### 9.3 정렬 순서 버그 수정
+
+**문제:** 여러 Worker의 shuffle 데이터가 같은 파일에 append되어 정렬 깨짐
+
+**원인:** `partition-0.received` 파일에 모든 sender 데이터 append
+
+**해결:** 각 sender별 고유 파일 생성
+```scala
+val streamId = UUID.randomUUID().toString.take(8)
+val partitionFile = s"partition-$partitionId-$streamId.received"
+```
+
+### 9.4 Crash Recovery 개선
+
+**문제:** Worker crash 후 `workerClients`에 해당 worker가 없으면 exception으로 실패
+
+**해결:**
+```scala
+// Before: throw exception
+val client = workerClients.getOrElse(targetWorker, throw ...)
+
+// After: refresh and retry
+val clientOpt = workerClients.get(targetWorker)
+if (clientOpt.isEmpty) {
+  refreshWorkerClients()
+  return sendPartitionWithRetry(...)
+}
+```
+
+### 9.5 gRPC 채널 누수 수정
+
+**문제:** `refreshWorkerClients()`에서 기존 client 닫지 않고 교체
+
+**해결:**
+```scala
+oldClients.values.foreach(_.close())
+workerClients = newClients
+```
+
+### 9.6 대용량 데이터 처리 최적화
+
+**Shuffle 수신:**
+- Before: 메모리 버퍼링 (`currentBuffer ++= chunk.data`)
+- After: 직접 파일 쓰기 (`currentOutputStream.write(...)`)
+
+**Shuffle 전송:**
+- Before: 모든 레코드 메모리 로드 후 파티셔닝
+- After: 스트리밍 방식으로 파티션 파일 생성 후 전송
+
+### 9.7 파티션 제한 확대
+
+```scala
+MAX_PARTITIONS_PER_WORKER = 99  // 10 → 99
+```
+
+**효과:**
+| Workers | Max Partitions | 30GB 원본 | 100GB 원본 |
+|---------|----------------|----------|-----------|
+| 3 | 297 | ~100MB/파티션 | ~340MB/파티션 |
+| 5 | 495 | ~60MB/파티션 | ~200MB/파티션 |
+
+### 9.8 Workflow 완료 후 오탐 수정
+
+**문제:** Workflow 완료 후 heartbeat 중단 시 "Worker Crashed" 오탐
+
+**해결:**
+```scala
+private def checkWorkerHealth(): Unit = {
+  if (workflowCompleted) return  // 완료 후 health check 스킵
+  // ...
+}
+```
+
+---
+
+## 10. 테스트 결과 (최종)
+
+| 테스트 | 결과 | 비고 |
+|--------|------|------|
+| 3 Workers, 200MB, 같은 input | ✅ | 레코드 분배 정상 동작 |
+| 정렬 검증 | ✅ | 2M 레코드 모두 정렬됨 |
+| SHUFFLING crash recovery | ✅ | Recovery Worker 정상 합류 |
+| gRPC 채널 누수 | ✅ | 경고 메시지 제거됨 |
+
+---
+
 **작성자**: Team Silver (권동연, 박범순, 임지훈)
-**버전**: Week 7 Final
+**버전**: Week 7 Final (Updated 2025-11-30)

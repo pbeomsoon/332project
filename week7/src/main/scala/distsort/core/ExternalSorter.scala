@@ -110,6 +110,68 @@ class ExternalSorter(
   }
 
   /**
+   * ⭐ Sort records from specific ranges within files
+   *
+   * This supports record-level distribution where each worker reads only
+   * its assigned portion of each file.
+   *
+   * @param recordRanges Sequence of (file, startRecord, recordCount) tuples
+   * @return Sorted chunk files
+   */
+  def sortRecordRanges(recordRanges: Seq[(File, Long, Long)]): Seq[File] = {
+    import java.io.RandomAccessFile
+    val RECORD_SIZE = 100
+
+    // Read all records from the assigned ranges
+    val allRecords = recordRanges.flatMap { case (file, startRecord, recordCount) =>
+      try {
+        val raf = new RandomAccessFile(file, "r")
+        try {
+          val startOffset = startRecord * RECORD_SIZE
+          raf.seek(startOffset)
+
+          val records = ArrayBuffer[Record]()
+          val buffer = new Array[Byte](RECORD_SIZE)
+          var recordsRead = 0L
+
+          while (recordsRead < recordCount && raf.getFilePointer < raf.length()) {
+            val bytesRead = raf.read(buffer)
+            if (bytesRead == RECORD_SIZE) {
+              val key = buffer.slice(0, 10).clone()
+              val value = buffer.slice(10, 100).clone()
+              records += Record(key, value)
+              recordsRead += 1
+            }
+          }
+
+          records.toSeq
+        } finally {
+          raf.close()
+        }
+      } catch {
+        case ex: Exception =>
+          // Fallback: read entire file if seek fails
+          val reader = RecordReader.create(file)
+          try {
+            Iterator.continually(reader.readRecord())
+              .takeWhile(_.isDefined)
+              .map(_.get)
+              .toSeq
+          } finally {
+            reader.close()
+          }
+      }
+    }
+
+    // Create sorted chunks
+    if (allRecords.isEmpty) {
+      Seq.empty
+    } else {
+      createSortedChunksParallel(allRecords)
+    }
+  }
+
+  /**
    * Sort a single chunk
    */
   private def sortChunk(records: Seq[Record], chunkIndex: Int): File = {

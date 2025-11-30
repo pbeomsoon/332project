@@ -234,11 +234,17 @@ class WorkerService(
 
   /**
    * New streaming shuffle data receiver using ShuffleDataChunk
+   * ⭐ FIX: Each sender's data is stored in a SEPARATE file to preserve sort order
+   * ⭐ FIX: Stream directly to file instead of buffering in memory (prevents OOM)
    */
   override def shuffleData(responseObserver: StreamObserver[ShuffleAck]): StreamObserver[ShuffleDataChunk] = {
+    // ⭐ Generate unique ID per stream (per sender) to avoid mixing sorted data
+    val streamId = java.util.UUID.randomUUID().toString.take(8)
+
     new StreamObserver[ShuffleDataChunk] {
       private var currentPartitionId: Int = -1
-      private var currentBuffer: mutable.ArrayBuffer[Byte] = mutable.ArrayBuffer.empty
+      private var currentOutputStream: FileOutputStream = _
+      private var currentFile: File = _
       private var totalBytesReceived: Long = 0
       private var chunksReceived: Int = 0
       private val startTime = System.currentTimeMillis()
@@ -248,24 +254,25 @@ class WorkerService(
           chunksReceived += 1
 
           if (chunk.partitionId != currentPartitionId) {
-            // New partition starting
-            if (currentPartitionId != -1 && currentBuffer.nonEmpty) {
-              // Save previous partition
-              savePartitionData(currentPartitionId, currentBuffer.toArray)
-            }
+            // New partition starting - close previous file if any
+            closeCurrentFile()
+
+            // Open new file for this partition
             currentPartitionId = chunk.partitionId
-            currentBuffer = mutable.ArrayBuffer.empty
+            currentFile = new File(receivedDir.toFile, s"partition-$currentPartitionId-$streamId.received")
+            currentOutputStream = new FileOutputStream(currentFile)
           }
 
-          // Append data to buffer
-          currentBuffer ++= chunk.data.toByteArray
-          totalBytesReceived += chunk.data.size()
+          // ⭐ FIX: Write directly to file (no memory buffering)
+          if (chunk.data.size() > 0) {
+            currentOutputStream.write(chunk.data.toByteArray)
+            totalBytesReceived += chunk.data.size()
+          }
 
           if (chunk.isLast) {
             // Last chunk for this partition
-            if (currentBuffer.nonEmpty) {
-              savePartitionData(currentPartitionId, currentBuffer.toArray)
-            }
+            closeCurrentFile()
+            partitionsReceived.incrementAndGet()
 
             // Send acknowledgment
             responseObserver.onNext(ShuffleAck(
@@ -280,6 +287,7 @@ class WorkerService(
         } catch {
           case ex: Exception =>
             logger.error(s"Error processing shuffle chunk: ${ex.getMessage}", ex)
+            closeCurrentFile()
             responseObserver.onNext(ShuffleAck(
               success = false,
               message = ex.getMessage,
@@ -290,24 +298,27 @@ class WorkerService(
 
       override def onError(t: Throwable): Unit = {
         logger.error(s"Shuffle data stream error: ${t.getMessage}", t)
+        closeCurrentFile()
         responseObserver.onError(t)
       }
 
       override def onCompleted(): Unit = {
+        closeCurrentFile()
         val duration = System.currentTimeMillis() - startTime
         logger.info(s"Shuffle data stream completed: received $chunksReceived chunks, " +
                    s"${totalBytesReceived} bytes in ${duration}ms")
         responseObserver.onCompleted()
       }
 
-      private def savePartitionData(partitionId: Int, data: Array[Byte]): Unit = {
-        val partitionFile = new File(receivedDir.toFile, s"partition-$partitionId.received")
-        val fos = new FileOutputStream(partitionFile, true) // Append mode
-        try {
-          fos.write(data)
-          partitionsReceived.incrementAndGet()
-        } finally {
-          fos.close()
+      private def closeCurrentFile(): Unit = {
+        if (currentOutputStream != null) {
+          try {
+            currentOutputStream.close()
+          } catch {
+            case ex: Exception =>
+              logger.warn(s"Error closing file: ${ex.getMessage}")
+          }
+          currentOutputStream = null
         }
       }
     }

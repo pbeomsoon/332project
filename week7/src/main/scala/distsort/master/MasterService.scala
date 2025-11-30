@@ -87,7 +87,7 @@ class MasterService(
   // ⭐ 파티션 크기를 작게 하여 더 많은 파티션 생성 (병렬성 향상)
   private val TARGET_PARTITION_SIZE_MB: Long = 32   // Target 32MB per partition (더 작은 조각)
   private val MIN_PARTITIONS_PER_WORKER: Int = 3    // 최소 worker당 3개 파티션 (항상 N*3 보장)
-  private val MAX_PARTITIONS_PER_WORKER: Int = 10   // Maximum partitions per worker
+  private val MAX_PARTITIONS_PER_WORKER: Int = 99   // Maximum partitions per worker (increased for large data)
 
   // Dynamic partition count (will be calculated after all workers register)
   @volatile private var numPartitions: Int = initialNumPartitions
@@ -117,6 +117,19 @@ class MasterService(
 
   // Shuffle map (partition ID -> worker index)
   @volatile private var shuffleMap: Map[Int, Int] = Map.empty
+
+  // ⭐ Record-level distribution: Maps worker index to assigned record ranges
+  // This ensures each RECORD is processed by exactly one worker (no duplicates)
+  // Even if there's only 1 file, records are split among workers
+  case class FileInfo(path: String, sizeBytes: Long) {
+    val RECORD_SIZE = 100L  // 10 byte key + 90 byte value
+    def recordCount: Long = sizeBytes / RECORD_SIZE
+  }
+  case class RecordRange(filePath: String, startRecord: Long, recordCount: Long, fileSizeBytes: Long)
+
+  private val allFileInfos = new ConcurrentHashMap[String, FileInfo]()  // path → FileInfo
+  private val workerRecordAssignments = new ConcurrentHashMap[Int, Seq[RecordRange]]()  // workerIndex → record ranges
+  @volatile private var fileDistributionDone: Boolean = false
 
   // Phase tracking
   private val phaseCompletions = new ConcurrentHashMap[WorkerPhase, ConcurrentHashMap[String, Boolean]]()
@@ -150,7 +163,8 @@ class MasterService(
     numCores: Int,
     availableMemory: Long,
     totalInputBytes: Long = 0,  // Input size for dynamic partitioning
-    registrationTime: Long = System.currentTimeMillis()
+    registrationTime: Long = System.currentTimeMillis(),
+    inputFiles: Seq[String] = Seq.empty  // ⭐ Input files reported by worker
   )
 
   /**
@@ -306,6 +320,19 @@ class MasterService(
         } else {
           // Capacity not full - new registration
           val workerIndex = workerIndexCounter.getAndIncrement()
+
+          // ⭐ Collect input files WITH sizes from worker (for record-level distribution)
+          // Use new inputFileInfos field if available, fallback to legacy inputFiles
+          val inputFileList = if (request.inputFileInfos.nonEmpty) {
+            request.inputFileInfos.foreach { info =>
+              allFileInfos.put(info.filePath, FileInfo(info.filePath, info.fileSize))
+            }
+            request.inputFileInfos.map(_.filePath).toSeq
+          } else {
+            // Legacy: only file paths, no sizes (will estimate from totalInputBytes)
+            request.inputFiles.toSeq
+          }
+
           val workerInfo = WorkerInfo(
             workerId = workerId,
             host = request.host,
@@ -313,7 +340,8 @@ class MasterService(
             workerIndex = workerIndex,
             numCores = request.numCores,
             availableMemory = request.availableMemory,
-            totalInputBytes = request.totalInputBytes  // Store input size for dynamic partitioning
+            totalInputBytes = request.totalInputBytes,  // Store input size for dynamic partitioning
+            inputFiles = inputFileList  // Store input files
           )
 
           registeredWorkers.put(workerId, workerInfo)
@@ -324,7 +352,12 @@ class MasterService(
           registrationLatch.countDown()
 
           val inputMB = request.totalInputBytes / 1024 / 1024
-          logger.info(s"NEW WORKER: $workerId registered (index: $workerIndex, input: ${inputMB}MB, ${registeredWorkers.size}/$expectedWorkers)")
+          logger.info(s"NEW WORKER: $workerId registered (index: $workerIndex, input: ${inputMB}MB, files: ${inputFileList.size}, ${registeredWorkers.size}/$expectedWorkers)")
+
+          // ⭐ Trigger file distribution when all workers register
+          if (registeredWorkers.size >= expectedWorkers && !fileDistributionDone) {
+            distributeFilesAmongWorkers()
+          }
 
           RegisterWorkerResponse(
             success = true,
@@ -336,6 +369,119 @@ class MasterService(
         }
       }
     }
+  }
+
+  /**
+   * ⭐ Distribute RECORDS among workers (no duplicates)
+   *
+   * When multiple workers share the same input directory, each RECORD should be
+   * processed by exactly one worker. This allows splitting even a single file
+   * among multiple workers. This method:
+   * 1. Collects all unique files and their sizes
+   * 2. Calculates total record count (file_size / 100 bytes per record)
+   * 3. Distributes records evenly - each worker gets (total_records / num_workers)
+   * 4. Stores record range assignments for later use
+   */
+  private def distributeFilesAmongWorkers(): Unit = synchronized {
+    if (fileDistributionDone) {
+      logger.info("File distribution already done, skipping")
+      return
+    }
+
+    val RECORD_SIZE = 100L  // 10 byte key + 90 byte value
+
+    // Collect all unique files with sizes, sorted for deterministic assignment
+    val fileInfos = allFileInfos.values().asScala.toSeq.sortBy(_.path)
+
+    if (fileInfos.isEmpty) {
+      logger.warn("No input files reported by any worker")
+      fileDistributionDone = true
+      return
+    }
+
+    // Calculate total records
+    val totalRecords = fileInfos.map(_.recordCount).sum
+    val workerIndices = registeredWorkers.values.map(_.workerIndex).toSeq.sorted
+    val numWorkers = workerIndices.size
+
+    if (totalRecords == 0) {
+      logger.warn("No records in input files")
+      fileDistributionDone = true
+      return
+    }
+
+    // Calculate records per worker (distribute evenly)
+    val baseRecordsPerWorker = totalRecords / numWorkers
+    val extraRecords = totalRecords % numWorkers  // First few workers get 1 extra
+
+    // Initialize assignments
+    val assignments = scala.collection.mutable.Map[Int, scala.collection.mutable.ArrayBuffer[RecordRange]]()
+    workerIndices.foreach(idx => assignments(idx) = scala.collection.mutable.ArrayBuffer.empty)
+
+    // Distribute records across files
+    var currentFileIdx = 0
+    var currentRecordInFile = 0L
+    var workerPosition = 0
+
+    while (workerPosition < numWorkers && currentFileIdx < fileInfos.size) {
+      val workerIdx = workerIndices(workerPosition)
+      val recordsForThisWorker = baseRecordsPerWorker + (if (workerPosition < extraRecords) 1 else 0)
+
+      var recordsAssigned = 0L
+
+      // Assign records from files until this worker has enough
+      while (recordsAssigned < recordsForThisWorker && currentFileIdx < fileInfos.size) {
+        val fileInfo = fileInfos(currentFileIdx)
+        val recordsInFile = fileInfo.recordCount
+        val recordsRemainingInFile = recordsInFile - currentRecordInFile
+        val recordsNeeded = recordsForThisWorker - recordsAssigned
+        val recordsToTake = math.min(recordsRemainingInFile, recordsNeeded)
+
+        if (recordsToTake > 0) {
+          assignments(workerIdx) += RecordRange(
+            filePath = fileInfo.path,
+            startRecord = currentRecordInFile,
+            recordCount = recordsToTake,
+            fileSizeBytes = fileInfo.sizeBytes
+          )
+          recordsAssigned += recordsToTake
+          currentRecordInFile += recordsToTake
+        }
+
+        // Move to next file if current is exhausted
+        if (currentRecordInFile >= recordsInFile) {
+          currentFileIdx += 1
+          currentRecordInFile = 0
+        }
+      }
+
+      workerPosition += 1
+    }
+
+    // Store assignments
+    assignments.foreach { case (workerIdx, ranges) =>
+      workerRecordAssignments.put(workerIdx, ranges.toSeq)
+    }
+
+    fileDistributionDone = true
+
+    // Log distribution
+    logger.info(s"⭐ Record Distribution Complete:")
+    logger.info(s"   Total files: ${fileInfos.size}, Total records: $totalRecords")
+    workerIndices.foreach { idx =>
+      val ranges = workerRecordAssignments.getOrDefault(idx, Seq.empty)
+      val totalAssigned = ranges.map(_.recordCount).sum
+      logger.info(s"   Worker $idx: $totalAssigned records from ${ranges.size} file range(s)")
+    }
+    System.err.println(s"[Master] ⭐ Record distribution: $totalRecords records → $numWorkers workers (${baseRecordsPerWorker} records/worker)")
+  }
+
+  /**
+   * Get assigned record ranges for a worker
+   * For recovery workers, they get the crashed worker's record ranges
+   */
+  def getAssignedRecordRanges(workerIndex: Int): Seq[RecordRange] = {
+    workerRecordAssignments.getOrDefault(workerIndex, Seq.empty)
   }
 
   /**
@@ -572,6 +718,70 @@ class MasterService(
   }
 
   /**
+   * Get file/record assignment for a worker
+   * Workers call this before sampling to get their assigned record ranges
+   * Blocks until file distribution is complete
+   */
+  override def getFileAssignment(request: GetFileAssignmentRequest): Future[GetFileAssignmentResponse] = {
+    Future {
+      val workerId = request.workerId
+
+      if (!registeredWorkers.contains(workerId)) {
+        logger.warn(s"File assignment requested by unregistered worker: $workerId")
+        GetFileAssignmentResponse(
+          ready = false,
+          assignedFiles = Seq.empty,
+          message = "Unregistered worker"
+        )
+      } else {
+        val workerInfo = registeredWorkers(workerId)
+        val workerIndex = workerInfo.workerIndex
+
+        // Wait for file distribution to complete (max 60 seconds)
+        val maxWaitMs = 60000
+        val startTime = System.currentTimeMillis()
+        while (!fileDistributionDone && System.currentTimeMillis() - startTime < maxWaitMs) {
+          Thread.sleep(100)
+        }
+
+        if (!fileDistributionDone) {
+          logger.warn(s"File distribution not complete after ${maxWaitMs}ms for worker $workerId")
+          // Return worker's own files if distribution not done (fallback)
+          GetFileAssignmentResponse(
+            ready = false,
+            assignedFiles = workerInfo.inputFiles,
+            message = "File distribution timeout - using own files"
+          )
+        } else {
+          // ⭐ Return record ranges (preferred) with legacy file paths for compatibility
+          val recordRanges = getAssignedRecordRanges(workerIndex)
+          val totalRecords = recordRanges.map(_.recordCount).sum
+          val uniqueFiles = recordRanges.map(_.filePath).distinct
+
+          // Convert to proto format
+          val protoRecordRanges = recordRanges.map { range =>
+            FileRecordRange(
+              filePath = range.filePath,
+              startRecord = range.startRecord,
+              recordCount = range.recordCount,
+              fileSizeBytes = range.fileSizeBytes
+            )
+          }
+
+          logger.info(s"Worker $workerId (index $workerIndex) assigned $totalRecords records from ${recordRanges.size} range(s)")
+
+          GetFileAssignmentResponse(
+            ready = true,
+            assignedFiles = uniqueFiles,  // Legacy compatibility
+            message = s"Assigned $totalRecords records",
+            recordRanges = protoRecordRanges  // ⭐ New record-level assignment
+          )
+        }
+      }
+    }
+  }
+
+  /**
    * Handle error reports
    */
   override def reportError(request: ReportErrorRequest): Future[ReportErrorResponse] = {
@@ -748,6 +958,12 @@ class MasterService(
    * - 시간 기준이 아닌 "횟수" 기준이므로 더 예측 가능
    */
   private def checkWorkerHealth(): Unit = {
+    // ⭐ Workflow 완료 후에는 health check 스킵
+    // Workers가 정상 종료하면서 heartbeat가 멈추는 것은 정상
+    if (workflowCompleted) {
+      return
+    }
+
     val now = Instant.now()
     val failedWorkers = scala.collection.mutable.ListBuffer[String]()
 

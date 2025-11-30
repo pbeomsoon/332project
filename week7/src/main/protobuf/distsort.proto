@@ -8,6 +8,12 @@ option java_outer_classname = "DistsortProto";
 // Common messages
 message Empty {}
 
+// Input file information for registration
+message InputFileInfo {
+  string file_path = 1;
+  int64 file_size = 2;  // Size in bytes
+}
+
 // Worker registration
 message RegisterWorkerRequest {
   string worker_id = 1;
@@ -16,6 +22,8 @@ message RegisterWorkerRequest {
   int32 num_cores = 4;
   int64 available_memory = 5;
   int64 total_input_bytes = 6;  // Total size of input files (for dynamic partitioning)
+  repeated string input_files = 7;  // (Legacy) List of input file paths
+  repeated InputFileInfo input_file_infos = 8;  // File paths with sizes (for record-level distribution)
 }
 
 message RegisterWorkerResponse {
@@ -123,6 +131,7 @@ message ShuffleResponse {
 message StartPhaseRequest {
   WorkerPhase phase = 1;
   string details = 2;
+  repeated string assigned_files = 3;  // Files assigned to this worker (for file distribution)
 }
 
 message StartPhaseResponse {
@@ -166,6 +175,27 @@ message HeartbeatResponse {
   string message = 3;
 }
 
+// File assignment request (for file distribution)
+message GetFileAssignmentRequest {
+  string worker_id = 1;
+}
+
+// Record range assignment for a single file
+// Allows splitting a file across multiple workers at record boundaries
+message FileRecordRange {
+  string file_path = 1;       // Absolute path to the file
+  int64 start_record = 2;     // Starting record index (0-based)
+  int64 record_count = 3;     // Number of records to read
+  int64 file_size_bytes = 4;  // Total file size for validation
+}
+
+message GetFileAssignmentResponse {
+  bool ready = 1;                              // True if file distribution is done
+  repeated string assigned_files = 2;          // (Legacy) Files assigned to this worker
+  string message = 3;
+  repeated FileRecordRange record_ranges = 4;  // Record-level assignments (preferred)
+}
+
 // Master Service
 service MasterService {
   // Worker registration and management
@@ -185,6 +215,9 @@ service MasterService {
 
   // Heartbeat for worker health monitoring
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  // File assignment for distributed input processing
+  rpc GetFileAssignment(GetFileAssignmentRequest) returns (GetFileAssignmentResponse);
 }
 
 // Request for shuffle data (used by recovery workers)
