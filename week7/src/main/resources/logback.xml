@@ -1,0 +1,21 @@
+<configuration>
+  <!-- File appender for logs (clean stdout output) -->
+  <appender name="FILE" class="ch.qos.logback.core.FileAppender">
+    <file>/tmp/distsort.log</file>
+    <encoder>
+      <pattern>%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n</pattern>
+    </encoder>
+  </appender>
+
+  <!-- 외부 라이브러리 로그 완전히 끄기 -->
+  <logger name="io.netty" level="OFF"/>
+  <logger name="io.grpc" level="OFF"/>
+  <logger name="io.perfmark" level="OFF"/>
+
+  <!-- 우리 애플리케이션만 INFO 레벨 -->
+  <logger name="distsort" level="INFO"/>
+
+  <root level="WARN">
+    <appender-ref ref="FILE"/>
+  </root>
+</configuration>
